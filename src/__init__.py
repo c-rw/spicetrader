@@ -1,0 +1,1 @@
+"""SpiceTrader - Kraken Trading Bot."""
