@@ -2,7 +2,7 @@
 import logging
 from typing import Optional, Dict, Any
 from .base import TradingStrategy
-from indicators import (
+from ..indicators import (
     calculate_rsi,
     calculate_bollinger_bands,
     detect_support_resistance,
@@ -122,27 +122,40 @@ class MeanReversionStrategy(TradingStrategy):
         Returns:
             'buy', 'sell', or None
         """
-        # Extract current price from ticker
-        ticker_data = market_data.get('ticker', {})
+        ohlc = market_data.get('ohlc')
 
-        # Find the actual pair key (handle Kraken's normalized names)
-        pair_key = self._find_pair_key(ticker_data)
-        if not pair_key:
-            logger.error("Trading pair not found in ticker data")
-            return None
+        # Prefer committed OHLC close series for indicator correctness.
+        if isinstance(ohlc, dict) and ohlc.get('closes'):
+            prices = list(ohlc['closes'])
+            current_price = (
+                float(ohlc['latest']['close'])
+                if isinstance(ohlc.get('latest'), dict) and 'close' in ohlc['latest']
+                else float(prices[-1])
+            )
+            self.add_price(current_price)
 
-        # Get current price
-        current_price = float(ticker_data[pair_key]['c'][0])
-        self.add_price(current_price)
+            required_periods = max(self.rsi_period, self.bb_period)
+            if len(prices) < required_periods + 1:
+                logger.info(f"Collecting data... ({len(prices)}/{required_periods + 1})")
+                return None
+        else:
+            # Extract current price from ticker
+            ticker_data = market_data.get('ticker', {})
 
-        # Need enough data for indicators
-        required_periods = max(self.rsi_period, self.bb_period)
-        if not self.has_sufficient_data(required_periods + 1):
-            logger.info(f"Collecting data... ({len(self.price_history)}/{required_periods + 1})")
-            return None
+            pair_key = self._find_pair_key(ticker_data)
+            if not pair_key:
+                logger.error("Trading pair not found in ticker data")
+                return None
 
-        # Get price history
-        prices = self.get_prices()
+            current_price = float(ticker_data[pair_key]['c'][0])
+            self.add_price(current_price)
+
+            required_periods = max(self.rsi_period, self.bb_period)
+            if not self.has_sufficient_data(required_periods + 1):
+                logger.info(f"Collecting data... ({len(self.price_history)}/{required_periods + 1})")
+                return None
+
+            prices = self.get_prices()
 
         # Calculate indicators
         rsi = calculate_rsi(prices, self.rsi_period)

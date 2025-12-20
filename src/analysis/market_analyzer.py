@@ -2,10 +2,8 @@
 import logging
 import time
 from typing import List, Dict, Any, Optional, Tuple
-import sys
-sys.path.insert(0, '..')
 
-from indicators import (
+from ..indicators import (
     calculate_adx,
     calculate_atr,
     calculate_choppiness_index,

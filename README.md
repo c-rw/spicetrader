@@ -37,11 +37,11 @@ SpiceTrader is an **intelligent trading bot** that doesn't rely on a single stra
 ```plaintext
 15:00 - BTC ranging between $95k-$102k
         → Bot selects Mean Reversion strategy
-        → Buys at support ($96k), sells at resistance ($101k)
-
-18:00 - BTC breaks out above $106k with strong volume
+├── scripts/
+│   └── verify_dry_run.py          # Safety helper
         → Bot detects volatile breakout after 3 confirmations
         → Switches to Breakout strategy
+├── data/                          # SQLite DB (runtime)
         → Trades the momentum
 
 20:00 - SOL in strong uptrend while BTC still volatile
@@ -110,6 +110,8 @@ SpiceTrader is an **intelligent trading bot** that doesn't rely on a single stra
 └─────────────────┘
 ```
 
+**Data note (important)**: For indicators like ATR/ADX and for volume-surge confirmation, the bot uses Kraken **OHLC candles** (not the 24h ticker high/low/volume). Kraken's OHLC endpoint includes a final "current" candle that is not yet committed; the bot automatically drops that last candle so calculations use committed data.
+
 ### Market State Detection
 
 The bot uses technical indicators to classify markets:
@@ -174,9 +176,8 @@ DRY_RUN=true
 ### 4. Test Connection
 
 ```bash
-cd src
-../venv/bin/python -c "
-from kraken.client import KrakenClient
+../.venv/bin/python -c "
+from src.kraken.client import KrakenClient
 import os
 from dotenv import load_dotenv
 load_dotenv()
@@ -192,14 +193,12 @@ If you see server time and balance, you're connected!
 
 **Single-Coin Adaptive Bot** (BTC only):
 ```bash
-cd src
-../venv/bin/python adaptive_bot.py
+./.venv/bin/python -m src.adaptive_bot
 ```
 
 **Multi-Coin Bot** (BTC, SOL, ETH, XMR):
 ```bash
-cd src
-../venv/bin/python multi_coin_bot.py
+./.venv/bin/python -m src.multi_coin_bot
 ```
 
 Both run in **dry-run mode** by default (no real trades).
@@ -312,7 +311,19 @@ XBTUSD_ORDER_SIZE=0.001   # 0.001 BTC
 SOLUSD_ORDER_SIZE=0.1     # 0.1 SOL
 ETHUSD_ORDER_SIZE=0.01    # 0.01 ETH
 XMRUSD_ORDER_SIZE=0.1     # 0.1 XMR
+
+# Market data (recommended)
+OHLC_INTERVAL=1           # Candle interval in minutes (1,5,15,30,60,...)
 ```
+
+### Exchange Order Rules (Automatic)
+
+For live trading, the bot normalizes orders using Kraken `AssetPairs` metadata before submitting:
+- Rounds **volume** down to allowed `lot_decimals`
+- Rounds **limit price** down to `tick_size` / `pair_decimals`
+- Enforces minimums like `ordermin` and `costmin` (when a price estimate is available)
+
+If normalization causes an order to round to zero or fall below minimums, the bot will log an error and skip placing that order.
 
 ### Adaptive Settings
 
@@ -376,7 +387,7 @@ MACD_SIGNAL=9
 #### Breakout
 ```bash
 ATR_MULTIPLIER=1.5        # ATR threshold
-VOLUME_THRESHOLD=1.5      # Volume surge (150% of avg)
+VOLUME_THRESHOLD=1.5      # Volume surge (150% of avg, based on per-candle volume)
 ```
 
 #### Grid Trading
@@ -1099,17 +1110,12 @@ sudo journalctl -u spicetrader -f
 
 ---
 
-### Docker Deployment (Coming Soon)
+### Docker Deployment
 
-```dockerfile
-# Future Dockerfile
-FROM python:3.10-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-CMD ["python", "src/multi_coin_bot.py"]
-```
+Docker deployment is supported via `docker-compose.yml`.
+
+- See `DOCKER.md` for setup and operations
+- The container runs as a non-root user (UID `10001`); make sure `./logs` and `./data` are writable by UID `10001`
 
 ---
 
@@ -1117,10 +1123,14 @@ CMD ["python", "src/multi_coin_bot.py"]
 
 ```plaintext
 spicetrader/
+├── DOCKER.md
+├── Dockerfile
+├── docker-compose.yml
 ├── src/
 │   ├── kraken/
 │   │   ├── __init__.py
 │   │   └── client.py              # Kraken API wrapper
+│   ├── market_data.py             # OHLC cache + parsing helpers
 │   ├── strategies/
 │   │   ├── __init__.py
 │   │   ├── base.py                # Strategy base class
@@ -1138,16 +1148,15 @@ spicetrader/
 │   ├── coin_trader.py             # Single-coin trader manager
 │   ├── adaptive_bot.py            # Single-coin adaptive bot
 │   ├── multi_coin_bot.py          # Multi-coin orchestrator
-│   └── bot.py                     # Basic bot (legacy)
-├── demos/
-│   ├── demo_adaptive.py           # Demo adaptive selection
-│   └── demo_mean_reversion.py     # Demo mean reversion
+│   └── (legacy bot removed)        # src/bot.py was removed (use adaptive_bot.py)
+├── scripts/
+│   └── verify_dry_run.py          # Safety helper
 ├── tests/                         # Unit tests
 ├── logs/                          # Log files
+├── data/                          # SQLite DB (runtime)
 ├── .env                           # Your configuration (create from .env.example)
 ├── .env.example                   # Configuration template
 ├── requirements.txt               # Python dependencies
-├── ADAPTIVE_TRADING_GUIDE.md      # Detailed strategy guide
 └── README.md                      # This file
 ```
 
@@ -1158,7 +1167,7 @@ spicetrader/
 ### Kraken Client
 
 ```python
-from kraken.client import KrakenClient
+from src.kraken.client import KrakenClient
 
 # Initialize
 client = KrakenClient(api_key, api_secret)
@@ -1193,7 +1202,7 @@ client.cancel_all_orders()
 ### Indicators
 
 ```python
-from indicators import *
+from src.indicators import *
 
 # Trend indicators
 rsi = calculate_rsi(prices, period=14)

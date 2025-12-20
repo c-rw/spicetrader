@@ -28,6 +28,10 @@ nano .env
 - `KRAKEN_API_SECRET` - Your Kraken API secret
 - `DRY_RUN=true` - Start with dry-run mode for testing
 
+**Recommended settings:**
+
+- `OHLC_INTERVAL=1` - Candle interval (minutes) used for indicator calculations
+
 ### 2. Build and Start the Container
 
 ```bash
@@ -92,6 +96,22 @@ The following directories are mounted as volumes to persist data:
 - `./data` - Trading database (trading.db)
 
 These directories are created automatically if they don't exist.
+
+#### Permissions (non-root container)
+
+The Docker image runs as a non-root user (UID `10001`). If you use bind mounts (the default in `docker-compose.yml`), make sure the host directories are writable by that UID:
+
+```bash
+mkdir -p logs data
+sudo chown -R 10001:10001 logs data
+```
+
+If you prefer, you can instead relax permissions:
+
+```bash
+mkdir -p logs data
+sudo chmod -R a+rwX logs data
+```
 
 ## Resource Limits
 
@@ -262,7 +282,7 @@ Run one-off commands:
 
 ```bash
 # Check connection
-docker-compose exec spicetrader python -c "from kraken.client import KrakenClient; import os; from dotenv import load_dotenv; load_dotenv(); client = KrakenClient(os.getenv('KRAKEN_API_KEY'), os.getenv('KRAKEN_API_SECRET')); print('Balance:', client.get_account_balance())"
+docker-compose exec spicetrader python -c "from src.kraken.client import KrakenClient; import os; from dotenv import load_dotenv; load_dotenv(); client = KrakenClient(os.getenv('KRAKEN_API_KEY'), os.getenv('KRAKEN_API_SECRET')); print('Balance:', client.get_account_balance())"
 
 # Run report
 docker-compose exec spicetrader python src/report.py
@@ -342,7 +362,7 @@ docker-compose logs --tail=50     # Last 50 lines
 ### Exec
 ```bash
 docker-compose exec spicetrader bash           # Shell access
-docker-compose exec spicetrader python src/... # Run Python
+docker-compose exec spicetrader python -m src.<module> # Run a module (e.g. src.report)
 ```
 
 ### Cleanup
