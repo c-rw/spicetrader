@@ -5,9 +5,9 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from collections import deque
 
-from analysis import MarketAnalyzer, StrategySelector, MarketCondition
-from fee_calculator import FeeCalculator
-from database import TradingDatabase
+from .analysis import MarketAnalyzer, StrategySelector, MarketCondition
+from .fee_calculator import FeeCalculator
+from .database import TradingDatabase
 
 logger = logging.getLogger(__name__)
 
@@ -221,20 +221,26 @@ class CoinTrader:
         Returns:
             'buy', 'sell', or None
         """
-        # Update price history
-        ticker_data = market_data.get('ticker', {})
-        if not ticker_data:
-            return None
+        # Update price history (prefer committed OHLC candles; fall back to ticker).
+        ohlc = market_data.get('ohlc')
+        if isinstance(ohlc, dict) and isinstance(ohlc.get('latest'), dict):
+            latest = ohlc['latest']
+            close = float(latest['close'])
+            high = float(latest['high'])
+            low = float(latest['low'])
+        else:
+            ticker_data = market_data.get('ticker', {})
+            if not ticker_data:
+                return None
 
-        # Find pair key
-        pair_key = self._find_pair_key(ticker_data)
-        if not pair_key:
-            return None
+            pair_key = self._find_pair_key(ticker_data)
+            if not pair_key:
+                return None
 
-        ticker = ticker_data[pair_key]
-        close = float(ticker['c'][0])
-        high = float(ticker['h'][0])
-        low = float(ticker['l'][0])
+            ticker = ticker_data[pair_key]
+            close = float(ticker['c'][0])
+            high = float(ticker['h'][0])
+            low = float(ticker['l'][0])
 
         self.update_price_history(close, high, low)
 

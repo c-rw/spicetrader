@@ -1,15 +1,15 @@
 """Multi-Coin Adaptive Trading Bot."""
 import os
-import sys
 import time
 import logging
 from typing import Dict, List, Optional
 from datetime import datetime
 from dotenv import load_dotenv
 
-from kraken.client import KrakenClient
-from coin_trader import CoinTrader
-from database import TradingDatabase
+from .kraken.client import KrakenClient
+from .coin_trader import CoinTrader
+from .database import TradingDatabase
+from .market_data import OHLCCache
 
 # Configure logging
 import pathlib
@@ -59,6 +59,10 @@ class MultiCoinBot:
         # Position sizing
         self.max_total_exposure = float(config.get('MAX_TOTAL_EXPOSURE', 75.0))  # % of account
         self.max_per_coin = float(config.get('MAX_PER_COIN', 25.0))  # % of account
+
+        # OHLC settings (used for indicator correctness)
+        self.ohlc_interval = int(config.get('OHLC_INTERVAL', 1))
+        self.ohlc_cache = OHLCCache(interval=self.ohlc_interval, maxlen=200)
 
         # Initialize database
         self.db = TradingDatabase()
@@ -113,7 +117,17 @@ class MultiCoinBot:
         """Get market data for a symbol."""
         try:
             ticker = self.client.get_ticker(symbol)
-            return {'ticker': ticker, 'timestamp': time.time()}
+            # Enrich with committed OHLC series for indicator/strategy calculations.
+            try:
+                self.ohlc_cache.update(self.client, symbol)
+            except Exception as e:
+                logger.debug(f"[{symbol}] OHLC update failed: {e}")
+
+            return {
+                'ticker': ticker,
+                'ohlc': self.ohlc_cache.get_series(symbol),
+                'timestamp': time.time()
+            }
         except Exception as e:
             logger.error(f"[{symbol}] Failed to get market data: {e}")
             return None
@@ -132,6 +146,12 @@ class MultiCoinBot:
             # Build result mapping, handling Kraken's pair naming variations
             result = {}
             for symbol in self.trading_pairs:
+                # Best-effort OHLC enrichment (OHLC cannot be fetched in a single batch call).
+                try:
+                    self.ohlc_cache.update(self.client, symbol)
+                except Exception as e:
+                    logger.debug(f"[{symbol}] OHLC update failed (batch): {e}")
+
                 # Try exact match first, then try Kraken variations
                 key = symbol
                 if symbol not in ticker_data:
@@ -149,7 +169,11 @@ class MultiCoinBot:
 
                 # Only include if we found data
                 if key in ticker_data:
-                    result[symbol] = {'ticker': {key: ticker_data[key]}, 'timestamp': timestamp}
+                    result[symbol] = {
+                        'ticker': {key: ticker_data[key]},
+                        'ohlc': self.ohlc_cache.get_series(symbol),
+                        'timestamp': timestamp,
+                    }
                 else:
                     logger.warning(f"[{symbol}] Not found in Kraken response (tried: {symbol}, {variations})")
 
@@ -216,12 +240,21 @@ class MultiCoinBot:
                 return True, None
 
             logger.info(f"[{symbol}] [⚠️  LIVE] Placing {order_type.upper()} {ordertype}: {size:.6f} @ ${price or 'market'} (dry_run=False)")
+
+            # Normalize/validate against Kraken AssetPairs rules.
+            volume_norm, price_norm = self.client.normalize_order(
+                pair=symbol,
+                ordertype=ordertype,
+                volume=size,
+                price=price,
+                current_price=price,
+            )
             result = self.client.add_order(
                 pair=symbol,
                 type=order_type,
                 ordertype=ordertype,
-                volume=size,
-                price=price,
+                volume=volume_norm,
+                price=price_norm,
                 validate=False
             )
 
@@ -437,7 +470,7 @@ def main():
 
     if not api_key or not api_secret:
         logger.error("API credentials not found")
-        sys.exit(1)
+        raise SystemExit(1)
 
     # Load configuration
     config = {
