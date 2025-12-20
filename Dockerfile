@@ -16,14 +16,19 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application code
 COPY src/ ./src/
-COPY config/ ./config/
 
 # Create directories for logs and data
 RUN mkdir -p /app/logs /app/data
+
+# Run as non-root user
+RUN useradd -m -u 10001 appuser \
+    && chown -R appuser:appuser /app
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
+USER appuser
+
 # Run the multi-coin bot by default
-CMD ["python", "src/multi_coin_bot.py"]
+CMD ["python", "-m", "src.multi_coin_bot"]

@@ -4,7 +4,8 @@ import hmac
 import hashlib
 import base64
 import urllib.parse
-from typing import Dict, Any, Optional
+from decimal import Decimal, ROUND_DOWN
+from typing import Dict, Any, Optional, Tuple
 import requests
 import logging
 
@@ -31,6 +32,9 @@ class KrakenClient:
         self.session.headers.update({
             'User-Agent': 'SpiceTrader/1.0'
         })
+
+        # Cache AssetPairs metadata for order validation/rounding.
+        self._asset_pairs_cache: Dict[str, Dict[str, Any]] = {}
 
     def _get_kraken_signature(self, urlpath: str, data: Dict[str, Any], nonce: str) -> str:
         """
@@ -98,7 +102,7 @@ class KrakenClient:
 
                 # Make request with increased timeout
                 timeout = 45  # Increased from 30 to handle slow responses
-                if private or data:
+                if private:
                     response = self.session.post(url, data=data, headers=headers, timeout=timeout)
                 else:
                     response = self.session.get(url, params=data, timeout=timeout)
@@ -161,6 +165,140 @@ class KrakenClient:
         if pair:
             data['pair'] = pair
         return self._make_request('AssetPairs', data)
+
+    def _select_asset_pair_key(self, requested_pair: str, asset_pairs: Dict[str, Any]) -> Optional[str]:
+        """Pick the best-matching key from an AssetPairs response."""
+        if not asset_pairs:
+            return None
+
+        if requested_pair in asset_pairs:
+            return requested_pair
+
+        for key, info in asset_pairs.items():
+            try:
+                if isinstance(info, dict) and info.get('altname') == requested_pair:
+                    return key
+            except Exception:
+                continue
+
+        # Fallback: some callers provide XBTUSD while Kraken may return XXBTZUSD
+        variations = [
+            requested_pair.replace('XBT', 'XXBT').replace('USD', 'ZUSD'),
+            requested_pair.replace('ETH', 'XETH').replace('USD', 'ZUSD'),
+            requested_pair.replace('XRP', 'XXRP').replace('USD', 'ZUSD'),
+            requested_pair.replace('XMR', 'XXMR').replace('USD', 'ZUSD'),
+        ]
+        for v in variations:
+            if v in asset_pairs:
+                return v
+
+        return next(iter(asset_pairs.keys()), None)
+
+    def get_asset_pair_rules(self, pair: str, refresh: bool = False) -> Dict[str, Any]:
+        """Return AssetPairs metadata for a requested pair (cached)."""
+        if not refresh and pair in self._asset_pairs_cache:
+            return self._asset_pairs_cache[pair]
+
+        asset_pairs = self.get_tradable_pairs(pair)
+        key = self._select_asset_pair_key(pair, asset_pairs)
+        if not key or key not in asset_pairs:
+            raise ValueError(f"AssetPairs did not return rules for pair={pair}")
+
+        rules = asset_pairs[key]
+        if not isinstance(rules, dict):
+            raise ValueError(f"Unexpected AssetPairs rules shape for pair={pair}")
+
+        self._asset_pairs_cache[pair] = rules
+        return rules
+
+    @staticmethod
+    def _round_down_decimal(value: Decimal, decimals: int) -> Decimal:
+        if decimals < 0:
+            return value
+        quant = Decimal('1').scaleb(-decimals)
+        return value.quantize(quant, rounding=ROUND_DOWN)
+
+    @staticmethod
+    def _round_down_to_tick(value: Decimal, tick_size: Decimal) -> Decimal:
+        if tick_size <= 0:
+            return value
+        # Floor to nearest tick.
+        return (value // tick_size) * tick_size
+
+    @classmethod
+    def normalize_order_with_rules(
+        cls,
+        rules: Dict[str, Any],
+        *,
+        ordertype: str,
+        volume: float,
+        price: Optional[float] = None,
+        current_price: Optional[float] = None,
+    ) -> Tuple[float, Optional[float]]:
+        """Normalize volume/price according to Kraken AssetPairs metadata.
+
+        - Rounds volume down to `lot_decimals`
+        - Rounds limit price down to `tick_size` (or `pair_decimals`)
+        - Enforces `ordermin`
+        - Enforces `costmin` when a price estimate is available
+        """
+        lot_decimals = int(rules.get('lot_decimals', 8))
+        pair_decimals = int(rules.get('pair_decimals', 5))
+
+        volume_dec = Decimal(str(volume))
+        volume_dec = cls._round_down_decimal(volume_dec, lot_decimals)
+        if volume_dec <= 0:
+            raise ValueError("Order volume rounds to 0")
+
+        ordermin = rules.get('ordermin')
+        if ordermin is not None:
+            if volume_dec < Decimal(str(ordermin)):
+                raise ValueError(f"Order volume {volume_dec} below ordermin {ordermin}")
+
+        normalized_price: Optional[Decimal] = None
+        if price is not None and ordertype != 'market':
+            price_dec = Decimal(str(price))
+
+            tick_size_raw = rules.get('tick_size')
+            if tick_size_raw is not None:
+                tick_size = Decimal(str(tick_size_raw))
+                if tick_size > 0:
+                    price_dec = cls._round_down_to_tick(price_dec, tick_size)
+
+            price_dec = cls._round_down_decimal(price_dec, pair_decimals)
+            if price_dec <= 0:
+                raise ValueError("Order price rounds to 0")
+            normalized_price = price_dec
+
+        # Enforce minimum cost when we can estimate it.
+        costmin = rules.get('costmin')
+        price_for_cost = normalized_price
+        if price_for_cost is None and current_price is not None:
+            price_for_cost = Decimal(str(current_price))
+        if costmin is not None and price_for_cost is not None:
+            cost = volume_dec * price_for_cost
+            if cost < Decimal(str(costmin)):
+                raise ValueError(f"Order cost {cost} below costmin {costmin}")
+
+        return (float(volume_dec), float(normalized_price) if normalized_price is not None else None)
+
+    def normalize_order(
+        self,
+        *,
+        pair: str,
+        ordertype: str,
+        volume: float,
+        price: Optional[float] = None,
+        current_price: Optional[float] = None,
+    ) -> Tuple[float, Optional[float]]:
+        rules = self.get_asset_pair_rules(pair)
+        return self.normalize_order_with_rules(
+            rules,
+            ordertype=ordertype,
+            volume=volume,
+            price=price,
+            current_price=current_price,
+        )
 
     def get_ticker(self, pair: str) -> Dict[str, Any]:
         """

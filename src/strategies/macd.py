@@ -2,9 +2,7 @@
 import logging
 from typing import Optional, Dict, Any
 from .base import TradingStrategy
-import sys
-sys.path.insert(0, '..')
-from indicators import calculate_macd
+from ..indicators import calculate_macd
 
 logger = logging.getLogger(__name__)
 
@@ -61,26 +59,40 @@ class MACDStrategy(TradingStrategy):
         Returns:
             'buy', 'sell', or None
         """
-        # Extract current price from ticker
-        ticker_data = market_data.get('ticker', {})
-        pair_key = self._find_pair_key(ticker_data)
+        ohlc = market_data.get('ohlc')
 
-        if not pair_key:
-            logger.error("Trading pair not found in ticker data")
-            return None
+        # Prefer committed OHLC close series for indicator correctness.
+        if isinstance(ohlc, dict) and ohlc.get('closes'):
+            prices = list(ohlc['closes'])
+            current_price = (
+                float(ohlc['latest']['close'])
+                if isinstance(ohlc.get('latest'), dict) and 'close' in ohlc['latest']
+                else float(prices[-1])
+            )
+            self.add_price(current_price)
 
-        # Get current price
-        current_price = float(ticker_data[pair_key]['c'][0])
-        self.add_price(current_price)
+            required = self.slow_period + self.signal_period
+            if len(prices) < required:
+                logger.info(f"Collecting data... ({len(prices)}/{required})")
+                return None
+        else:
+            # Fallback: Extract current price from ticker
+            ticker_data = market_data.get('ticker', {})
+            pair_key = self._find_pair_key(ticker_data)
 
-        # Need enough data for MACD
-        required = self.slow_period + self.signal_period
-        if not self.has_sufficient_data(required):
-            logger.info(f"Collecting data... ({len(self.price_history)}/{required})")
-            return None
+            if not pair_key:
+                logger.error("Trading pair not found in ticker data")
+                return None
 
-        # Get price history
-        prices = self.get_prices()
+            current_price = float(ticker_data[pair_key]['c'][0])
+            self.add_price(current_price)
+
+            required = self.slow_period + self.signal_period
+            if not self.has_sufficient_data(required):
+                logger.info(f"Collecting data... ({len(self.price_history)}/{required})")
+                return None
+
+            prices = self.get_prices()
 
         # Calculate MACD
         macd_result = calculate_macd(prices, self.fast_period, self.slow_period, self.signal_period)

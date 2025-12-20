@@ -3,7 +3,7 @@ import logging
 import time
 from typing import Optional, Dict, Any
 from .base import TradingStrategy
-from indicators import calculate_sma
+from ..indicators import calculate_sma
 
 logger = logging.getLogger(__name__)
 
@@ -71,26 +71,39 @@ class SMACrossoverStrategy(TradingStrategy):
         Returns:
             'buy', 'sell', or None
         """
-        # Extract current price from ticker
-        ticker_data = market_data.get('ticker', {})
+        ohlc = market_data.get('ohlc')
 
-        # Find the actual pair key
-        pair_key = self._find_pair_key(ticker_data)
-        if not pair_key:
-            logger.error("Trading pair not found in ticker data")
-            return None
+        # Prefer committed OHLC close series for indicator correctness.
+        if isinstance(ohlc, dict) and ohlc.get('closes'):
+            prices = list(ohlc['closes'])
+            current_price = (
+                float(ohlc['latest']['close'])
+                if isinstance(ohlc.get('latest'), dict) and 'close' in ohlc['latest']
+                else float(prices[-1])
+            )
+            self.add_price(current_price)
 
-        # Get current price
-        current_price = float(ticker_data[pair_key]['c'][0])
-        self.add_price(current_price)
+            if len(prices) < self.slow_period:
+                logger.info(f"Collecting data... ({len(prices)}/{self.slow_period})")
+                return None
+        else:
+            # Extract current price from ticker
+            ticker_data = market_data.get('ticker', {})
 
-        # Need enough data for slow SMA
-        if not self.has_sufficient_data(self.slow_period):
-            logger.info(f"Collecting data... ({len(self.price_history)}/{self.slow_period})")
-            return None
+            # Find the actual pair key
+            pair_key = self._find_pair_key(ticker_data)
+            if not pair_key:
+                logger.error("Trading pair not found in ticker data")
+                return None
 
-        # Get price history
-        prices = self.get_prices()
+            current_price = float(ticker_data[pair_key]['c'][0])
+            self.add_price(current_price)
+
+            if not self.has_sufficient_data(self.slow_period):
+                logger.info(f"Collecting data... ({len(self.price_history)}/{self.slow_period})")
+                return None
+
+            prices = self.get_prices()
 
         # Calculate current SMAs
         fast_sma = calculate_sma(prices, self.fast_period)

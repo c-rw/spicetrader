@@ -1,10 +1,8 @@
 """Strategy selector based on market conditions."""
 import logging
 from typing import Dict, Any
-import sys
-sys.path.insert(0, '..')
 
-from strategies import (
+from ..strategies import (
     TradingStrategy,
     MeanReversionStrategy,
     SMACrossoverStrategy,

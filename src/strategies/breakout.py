@@ -2,9 +2,7 @@
 import logging
 from typing import Optional, Dict, Any
 from .base import TradingStrategy
-import sys
-sys.path.insert(0, '..')
-from indicators import (
+from ..indicators import (
     calculate_atr,
     calculate_volume_surge,
     detect_support_resistance,
@@ -81,30 +79,53 @@ class BreakoutStrategy(TradingStrategy):
         Returns:
             'buy', 'sell', or None
         """
-        # Extract current price from ticker
-        ticker_data = market_data.get('ticker', {})
-        pair_key = self._find_pair_key(ticker_data)
+        ohlc = market_data.get('ohlc')
 
-        if not pair_key:
-            logger.error("Trading pair not found in ticker data")
-            return None
+        # Prefer committed OHLC candles for correctness (high/low/volume per candle).
+        if isinstance(ohlc, dict) and ohlc.get('closes') and ohlc.get('highs') and ohlc.get('lows'):
+            closes = list(ohlc['closes'])
+            highs = list(ohlc['highs'])
+            lows = list(ohlc['lows'])
+            volumes = list(ohlc.get('volumes') or [])
+            current_price = float(ohlc['latest']['close']) if isinstance(ohlc.get('latest'), dict) else float(closes[-1])
 
-        # Get price and volume
-        ticker = ticker_data[pair_key]
-        current_price = float(ticker['c'][0])
-        current_volume = float(ticker['v'][1])  # 24h volume
+            # Keep internal history in sync for any base-class helpers.
+            self.add_price(current_price)
+            if volumes:
+                self.volume_history = volumes[-self.price_history.maxlen:]
 
-        self.add_price(current_price)
-        self.volume_history.append(current_volume)
+            # Need enough data across indicators.
+            required = max(self.lookback_period + 1, self.atr_period + 1, 21)
+            if len(closes) < required:
+                logger.info(f"Collecting data... ({len(closes)}/{required})")
+                return None
 
-        # Need enough data
-        required = max(self.atr_period, self.lookback_period)
-        if not self.has_sufficient_data(required):
-            logger.info(f"Collecting data... ({len(self.price_history)}/{required})")
-            return None
+            prices = closes
+        else:
+            # Fallback: use ticker (less accurate for ATR/volume).
+            ticker_data = market_data.get('ticker', {})
+            pair_key = self._find_pair_key(ticker_data)
 
-        # Get price history
-        prices = self.get_prices()
+            if not pair_key:
+                logger.error("Trading pair not found in ticker data")
+                return None
+
+            ticker = ticker_data[pair_key]
+            current_price = float(ticker['c'][0])
+            current_volume = float(ticker['v'][1])  # 24h volume (fallback only)
+
+            self.add_price(current_price)
+            self.volume_history.append(current_volume)
+
+            required = max(self.atr_period, self.lookback_period)
+            if not self.has_sufficient_data(required):
+                logger.info(f"Collecting data... ({len(self.price_history)}/{required})")
+                return None
+
+            prices = self.get_prices()
+
+            highs = [p * 1.005 for p in prices]
+            lows = [p * 0.995 for p in prices]
 
         # Detect support and resistance levels
         support_levels, resistance_levels = detect_support_resistance(
@@ -134,21 +155,17 @@ class BreakoutStrategy(TradingStrategy):
                 logger.info(f"   127.2%: ${fib_extensions['127.2%']:,.0f} | 161.8%: ${fib_extensions['161.8%']:,.0f} | 261.8%: ${fib_extensions['261.8%']:,.0f}")
 
         # Calculate ATR for volatility confirmation
-        # Create high/low approximations from prices
-        highs = [p * 1.005 for p in prices]  # Approximate 0.5% above
-        lows = [p * 0.995 for p in prices]   # Approximate 0.5% below
-
         atr = calculate_atr(highs, lows, prices, self.atr_period)
 
         if atr is None:
             return None
 
-        # Check for volume surge
-        volume_surge = calculate_volume_surge(
-            self.volume_history,
-            period=20,
-            threshold=self.volume_threshold
-        )
+        # Check for volume surge (prefer per-candle volumes; fallback uses 24h volume history)
+        volume_series = self.volume_history
+        if isinstance(ohlc, dict) and ohlc.get('volumes'):
+            volume_series = list(ohlc['volumes'])
+
+        volume_surge = calculate_volume_surge(volume_series, period=20, threshold=self.volume_threshold)
 
         # Log current state
         logger.info(f"Price: ${current_price:,.2f} | ATR: ${atr:.2f} | Vol Surge: {volume_surge}")
@@ -159,10 +176,28 @@ class BreakoutStrategy(TradingStrategy):
 
         # Detect breakout conditions
 
+        def atr_is_high(lookback: int = 20) -> bool:
+            # Compare current ATR to average ATR over recent windows.
+            if len(prices) < self.atr_period + 2:
+                return False
+            start = max(self.atr_period + 1, len(prices) - (lookback + self.atr_period))
+            atr_vals = []
+            for end in range(start, len(prices) + 1):
+                window_highs = highs[max(0, end - (self.atr_period + 1)):end]
+                window_lows = lows[max(0, end - (self.atr_period + 1)):end]
+                window_closes = prices[max(0, end - (self.atr_period + 1)):end]
+                v = calculate_atr(window_highs, window_lows, window_closes, self.atr_period)
+                if v is not None:
+                    atr_vals.append(v)
+            if len(atr_vals) < 3:
+                return False
+            avg_atr = sum(atr_vals[:-1]) / max(1, (len(atr_vals) - 1))
+            return avg_atr > 0 and atr >= avg_atr
+
         # BULLISH BREAKOUT: Breaking above resistance
         if self.last_resistance and current_price > self.last_resistance:
             # Check confirmations
-            atr_high = atr > (sum([calculate_atr(highs[-20:], lows[-20:], prices[-20:], self.atr_period) or 0]) / 20)
+            atr_high = atr_is_high()
 
             if volume_surge and atr_high:
                 logger.info(f"🚀 BULLISH BREAKOUT DETECTED!")
@@ -187,7 +222,7 @@ class BreakoutStrategy(TradingStrategy):
 
         # BEARISH BREAKOUT: Breaking below support
         elif self.last_support and current_price < self.last_support:
-            atr_high = atr > (sum([calculate_atr(highs[-20:], lows[-20:], prices[-20:], self.atr_period) or 0]) / 20)
+            atr_high = atr_is_high()
 
             if volume_surge and atr_high:
                 logger.info(f"🔻 BEARISH BREAKOUT DETECTED!")

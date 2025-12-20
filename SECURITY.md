@@ -44,7 +44,7 @@ We will respond within 48 hours and provide a timeline for fixes.
 - **Don't expose ports** publicly unless using authentication
 - **Keep images updated**: Rebuild regularly with `docker-compose build --no-cache`
 - **Limit container resources**: Memory limits already set in docker-compose.yml
-- **Use non-root user**: Container runs as non-root by default
+- **Use non-root user**: The Docker image runs as a non-root user (UID `10001`). If you use bind mounts for `./logs` and `./data`, ensure those directories are writable by UID `10001`.
 
 ### Database Security
 

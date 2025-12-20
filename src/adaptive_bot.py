@@ -1,6 +1,5 @@
 """Adaptive trading bot that automatically selects and switches strategies."""
 import os
-import sys
 import time
 import logging
 from typing import Optional
@@ -8,10 +7,11 @@ from datetime import datetime, timedelta
 from collections import deque
 from dotenv import load_dotenv
 
-from kraken.client import KrakenClient
-from analysis import MarketAnalyzer, StrategySelector, MarketCondition, MarketState
-from fee_calculator import FeeCalculator
-from database import TradingDatabase
+from .kraken.client import KrakenClient
+from .market_data import OHLCCache
+from .analysis import MarketAnalyzer, StrategySelector, MarketCondition, MarketState
+from .fee_calculator import FeeCalculator
+from .database import TradingDatabase
 
 # Configure logging
 import pathlib
@@ -55,6 +55,10 @@ class AdaptiveBot:
         self.order_size = float(config.get('ORDER_SIZE', 0.001))
         self.dry_run = config.get('DRY_RUN', 'true').lower() == 'true'
         self.api_call_delay = float(config.get('API_CALL_DELAY', 1.0))
+
+        # OHLC settings (used for indicator correctness)
+        self.ohlc_interval = int(config.get('OHLC_INTERVAL', 1))
+        self.ohlc_cache = OHLCCache(interval=self.ohlc_interval, maxlen=200)
 
         # Adaptive settings
         self.reanalysis_interval = int(config.get('REANALYSIS_INTERVAL', 1800))  # 30 min default
@@ -140,9 +144,15 @@ class AdaptiveBot:
             ticker = self.client.get_ticker(self.trading_pair)
             order_book = self.client.get_order_book(self.trading_pair, count=10)
 
+            try:
+                self.ohlc_cache.update(self.client, self.trading_pair)
+            except Exception as e:
+                logger.debug(f"OHLC update failed: {e}")
+
             return {
                 'ticker': ticker,
                 'order_book': order_book,
+                'ohlc': self.ohlc_cache.get_series(self.trading_pair),
                 'timestamp': time.time()
             }
         except Exception as e:
@@ -311,23 +321,21 @@ class AdaptiveBot:
 
     def update_price_history(self, market_data: dict):
         """Update price history from market data. Deque automatically maintains max size."""
-        ticker_data = market_data.get('ticker', {})
-
-        # Find pair key
-        pair_key = None
-        for key in ticker_data.keys():
-            if 'XXBT' in key or 'XBT' in key:
-                pair_key = key
-                break
-
-        if not pair_key:
-            return
-
-        # Extract prices
-        ticker = ticker_data[pair_key]
-        close = float(ticker['c'][0])
-        high = float(ticker['h'][0])
-        low = float(ticker['l'][0])
+        ohlc = market_data.get('ohlc')
+        if isinstance(ohlc, dict) and isinstance(ohlc.get('latest'), dict):
+            latest = ohlc['latest']
+            close = float(latest['close'])
+            high = float(latest['high'])
+            low = float(latest['low'])
+        else:
+            ticker_data = market_data.get('ticker', {})
+            pair_key = self._get_pair_key(ticker_data)
+            if not pair_key:
+                return
+            ticker = ticker_data[pair_key]
+            close = float(ticker['c'][0])
+            high = float(ticker['h'][0])
+            low = float(ticker['l'][0])
 
         self.price_history.append(close)
         self.high_history.append(high)
@@ -367,12 +375,24 @@ class AdaptiveBot:
             logger.info(f"[⚠️  LIVE] Placing {order_type} {ordertype} order: "
                       f"{self.order_size} {self.trading_pair}" +
                       (f" @ ${price:,.2f}" if price else "") + " (dry_run=False)")
+
+            # Normalize/validate against Kraken AssetPairs rules.
+            price_estimate = price
+            if price_estimate is None and self.price_history:
+                price_estimate = float(self.price_history[-1])
+            volume_norm, price_norm = self.client.normalize_order(
+                pair=self.trading_pair,
+                ordertype=ordertype,
+                volume=self.order_size,
+                price=price,
+                current_price=price_estimate,
+            )
             result = self.client.add_order(
                 pair=self.trading_pair,
                 type=order_type,
                 ordertype=ordertype,
-                volume=self.order_size,
-                price=price,
+                volume=volume_norm,
+                price=price_norm,
                 validate=False
             )
 
@@ -625,7 +645,7 @@ def main():
 
     if not api_key or not api_secret:
         logger.error("API credentials not found.")
-        sys.exit(1)
+        raise SystemExit(1)
 
     # Load configuration
     config = {
