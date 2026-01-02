@@ -42,6 +42,14 @@ docker-compose up -d
 docker-compose up -d --build
 ```
 
+### 2b. Dashboard (UI + API)
+
+The Docker Compose setup also includes a read-only dashboard:
+- **UI**: [http://localhost:3000](http://localhost:3000)
+- **API**: [http://localhost:8000](http://localhost:8000)
+
+The API mounts `./data` read-only and reads `./data/trading.db`. If the DB file doesn't exist yet, start the bot first so it can create it.
+
 ### 3. Monitor the Bot
 
 ```bash
@@ -79,6 +87,10 @@ All configuration is done through the `.env` file. The Docker container will aut
 # Trading mode
 DRY_RUN=true              # Keep true for testing
 TRADING_PAIRS=XBTUSD,SOLUSD,ETHUSD,XMRUSD
+
+# Exit / risk behavior
+MIN_PROFIT_TARGET=0.010
+MIN_HOLD_TIME=900
 
 # API credentials
 KRAKEN_API_KEY=your_key
