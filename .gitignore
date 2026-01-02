@@ -45,8 +45,15 @@ logs/*.log
 
 # Data
 *.csv
-*.json
 *.db
+
+# Data (JSON exports)
+data/**/*.json
+
+# SvelteKit
+ui/node_modules/
+ui/.svelte-kit/
+ui/build/
 
 # Testing
 .pytest_cache/

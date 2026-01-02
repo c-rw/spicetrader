@@ -201,6 +201,19 @@ If you see server time and balance, you're connected!
 ./.venv/bin/python -m src.multi_coin_bot
 ```
 
+### Docker (Bot + Dashboard)
+
+To run the bot plus the read-only dashboard (API + UI) together:
+
+```bash
+docker compose up -d --build
+```
+
+- UI: [http://localhost:3000](http://localhost:3000)
+- API: [http://localhost:8000](http://localhost:8000)
+
+If the bot fails at startup with a `PermissionError` writing logs, see the permissions section in [DOCKER.md](DOCKER.md).
+
 Both run in **dry-run mode** by default (no real trades).
 
 ---
@@ -631,6 +644,8 @@ Signal: BUY
 TRADING_PAIR=XBTUSD
 ORDER_SIZE=0.001
 DRY_RUN=true
+MIN_PROFIT_TARGET=0.010
+MIN_HOLD_TIME=900
 ```
 
 ---
@@ -700,6 +715,8 @@ TRADING_PAIRS=XBTUSD,SOLUSD,ETHUSD,XMRUSD
 MAX_TOTAL_EXPOSURE=75
 MAX_PER_COIN=25
 DRY_RUN=true
+MIN_PROFIT_TARGET=0.010
+MIN_HOLD_TIME=900
 ```
 
 ---
