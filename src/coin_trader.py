@@ -199,7 +199,25 @@ class CoinTrader:
 
         # Update tracking
         self.last_switch_time = time.time()
-        self.switches_today += 1
+
+        # Record switch in DB (before we clear pending confirmations).
+        switches_today_after = self.switches_today + 1
+        if self.db:
+            try:
+                self.db.record_strategy_switch(
+                    symbol=self.symbol,
+                    from_strategy=old_strategy_name,
+                    to_strategy=new_strategy_name,
+                    reason=market_condition.description,
+                    market_state=market_condition.state.value,
+                    confidence=float(market_condition.confidence),
+                    confirmations=int(self.pending_confirmations),
+                    switches_today=int(switches_today_after),
+                )
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] Failed to record strategy switch in DB: {e}")
+
+        self.switches_today = switches_today_after
         self.pending_state = None
         self.pending_confirmations = 0
 
@@ -302,6 +320,19 @@ class CoinTrader:
             fee: Fee paid (if known), otherwise estimated
             dry_run: Whether this is a dry run trade
         """
+        # Safety: don't create multiple open DB positions for the same symbol.
+        if self.db:
+            try:
+                existing = self.db.get_open_position(self.symbol)
+            except Exception as e:
+                existing = None
+                logger.warning(f"[{self.symbol}] Failed to check existing open position: {e}")
+
+            if existing:
+                self.current_position_id = int(existing.get('id'))
+                logger.warning(f"[{self.symbol}] Entry skipped - open position already exists (id={self.current_position_id})")
+                return
+
         self.entry_price = price
         self.entry_fee = fee if fee > 0 else self.fee_calculator.calculate_fee(price * volume)
 
@@ -345,6 +376,12 @@ class CoinTrader:
                 dry_run=dry_run
             )
 
+            # Keep in-memory position state consistent.
+            try:
+                self.current_strategy.update_position(position_type)
+            except Exception:
+                pass
+
     def record_exit(self, price: float, volume: float, fee: float = 0.0, dry_run: bool = True):
         """
         Record exit from a position and calculate P&L.
@@ -355,14 +392,34 @@ class CoinTrader:
             fee: Fee paid (if known), otherwise estimated
             dry_run: Whether this is a dry run trade
         """
+        open_position = None
+        if self.db:
+            try:
+                open_position = self.db.get_open_position(self.symbol)
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] Failed to fetch open position from DB: {e}")
+
+        # If we restarted, in-memory entry_price may be missing; recover from DB.
         if self.entry_price is None:
-            logger.warning(f"[{self.symbol}] Exit recorded but no entry price!")
-            return
+            if open_position:
+                self.entry_price = float(open_position['entry_price'])
+                try:
+                    self.entry_fee = float(open_position.get('entry_fee') or 0.0)
+                except Exception:
+                    self.entry_fee = 0.0
+                self.current_position_id = int(open_position.get('id'))
+                logger.info(f"[{self.symbol}] Recovered entry from DB (id={self.current_position_id})")
+            else:
+                logger.warning(f"[{self.symbol}] Exit recorded but no entry price and no open DB position")
+                return
 
         self.exit_fee = fee if fee > 0 else self.fee_calculator.calculate_fee(price * volume)
 
-        # Calculate P&L
-        position_type = 'long' if self.current_strategy and self.current_strategy.position == 'long' else 'short'
+        # Calculate P&L (prefer DB position_type; strategy.position may be unset).
+        if open_position and open_position.get('position_type') in ('long', 'short'):
+            position_type = open_position['position_type']
+        else:
+            position_type = 'long' if self.current_strategy and self.current_strategy.position == 'long' else 'long'
         gross_pnl, total_fees, net_pnl = self.fee_calculator.calculate_net_pnl(
             entry_price=self.entry_price,
             exit_price=price,
@@ -391,7 +448,10 @@ class CoinTrader:
         )
 
         # Record in database
-        if self.db and self.current_position_id:
+        if self.db and (self.current_position_id or (open_position and open_position.get('id'))):
+            if not self.current_position_id and open_position and open_position.get('id'):
+                self.current_position_id = int(open_position['id'])
+
             # Close position in database
             self.db.close_position(
                 position_id=self.current_position_id,
@@ -419,6 +479,13 @@ class CoinTrader:
             )
 
             self.current_position_id = None
+
+            # Keep in-memory position state consistent.
+            if self.current_strategy:
+                try:
+                    self.current_strategy.update_position(None)
+                except Exception:
+                    pass
 
         # Reset for next trade
         self.entry_price = None
