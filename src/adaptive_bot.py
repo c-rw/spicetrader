@@ -12,6 +12,7 @@ from .market_data import OHLCCache
 from .analysis import MarketAnalyzer, StrategySelector, MarketCondition, MarketState
 from .fee_calculator import FeeCalculator
 from .database import TradingDatabase
+from .position_sizing import equal_split_quote_allocation
 
 # Configure logging
 import pathlib
@@ -53,6 +54,9 @@ class AdaptiveBot:
         # Extract configuration
         self.trading_pair = config.get('TRADING_PAIR', 'XBTUSD')
         self.order_size = float(config.get('ORDER_SIZE', 0.001))
+        self.position_sizing_mode = str(config.get('POSITION_SIZING_MODE', 'pct')).strip().lower()
+        self.fee_buffer_pct = float(config.get('FEE_BUFFER_PCT', 1.0))
+        self.max_total_exposure = float(config.get('MAX_TOTAL_EXPOSURE', 100.0))
         self.dry_run = config.get('DRY_RUN', 'true').lower() == 'true'
         self.api_call_delay = float(config.get('API_CALL_DELAY', 1.0))
 
@@ -75,7 +79,12 @@ class AdaptiveBot:
         self.entry_price = None
         self.entry_fee = None
         self.exit_fee = None
+        self.entry_volume = None
         self.current_position_id = None
+
+        # Account state (quote-currency trade balance, e.g., USD)
+        self.account_balance = 0.0
+        self.last_balance_log = time.time()
 
         # Current state
         self.current_strategy = None
@@ -108,6 +117,7 @@ class AdaptiveBot:
 
         logger.info(f"Adaptive Bot initialized for {self.trading_pair}")
         logger.info(f"Dry run mode: {self.dry_run}")
+        logger.info(f"Position sizing mode: {self.position_sizing_mode}")
         logger.info(f"Fee tracking: {self.track_fees}")
         logger.info(f"Re-analysis interval: {self.reanalysis_interval}s ({self.reanalysis_interval/60:.0f} min)")
         logger.info(f"Switch cooldown: {self.switch_cooldown}s ({self.switch_cooldown/60:.0f} min)")
@@ -133,10 +143,53 @@ class AdaptiveBot:
             trade_balance = self.client.get_trade_balance()
             logger.info(f"Trade balance: ${float(trade_balance.get('eb', 0)):,.2f}")
 
+            # Cache for sizing (best-effort)
+            try:
+                self.account_balance = float(trade_balance.get('eb', 0))
+            except Exception:
+                self.account_balance = 0.0
+
             return True
         except Exception as e:
             logger.error(f"Failed to access account: {e}")
             return False
+
+    def update_account_balance(self) -> bool:
+        """Update cached quote balance used for sizing."""
+        try:
+            trade_balance = self.client.get_trade_balance()
+            self.account_balance = float(trade_balance.get('eb', 0))
+
+            # Log balance only every 60 seconds to reduce verbosity
+            current_time = time.time()
+            if current_time - self.last_balance_log >= 60:
+                logger.info(f"Account Balance: ${self.account_balance:,.2f}")
+                self.last_balance_log = current_time
+
+            return True
+        except Exception as e:
+            logger.error(f"Failed to get balance: {e}")
+            return False
+
+    def _calculate_order_volume(self, price_estimate: Optional[float]) -> float:
+        """Calculate order volume in base currency (e.g., BTC) for this pair."""
+        if self.position_sizing_mode not in {"equal", "equal_split", "per_coin", "dynamic"}:
+            return float(self.order_size)
+
+        if not price_estimate or price_estimate <= 0:
+            return float(self.order_size)
+
+        # Single-coin bot => "divide by how many coins" is 1.
+        per_coin_value = equal_split_quote_allocation(
+            self.account_balance,
+            1,
+            fee_buffer_pct=self.fee_buffer_pct,
+            exposure_pct=self.max_total_exposure,
+        )
+        if per_coin_value <= 0:
+            return float(self.order_size)
+
+        return per_coin_value / float(price_estimate)
 
     def get_market_data(self) -> Optional[dict]:
         """Get current market data."""
@@ -366,24 +419,33 @@ class AdaptiveBot:
         try:
             ordertype = 'limit' if price else 'market'
 
-            if self.dry_run:
-                logger.info(f"[🔸 DRY RUN] Would place {order_type} {ordertype} order: "
-                          f"{self.order_size} {self.trading_pair}" +
-                          (f" @ ${price:,.2f}" if price else "") + " (dry_run=True)")
-                return {'dry_run': True, 'type': order_type, 'ordertype': ordertype}
-
-            logger.info(f"[⚠️  LIVE] Placing {order_type} {ordertype} order: "
-                      f"{self.order_size} {self.trading_pair}" +
-                      (f" @ ${price:,.2f}" if price else "") + " (dry_run=False)")
-
-            # Normalize/validate against Kraken AssetPairs rules.
+            # Estimate price for sizing/normalization.
             price_estimate = price
             if price_estimate is None and self.price_history:
                 price_estimate = float(self.price_history[-1])
+
+            volume = self._calculate_order_volume(price_estimate)
+
+            if self.dry_run:
+                logger.info(f"[🔸 DRY RUN] Would place {order_type} {ordertype} order: "
+                          f"{volume} {self.trading_pair}" +
+                          (f" @ ${price:,.2f}" if price else "") + " (dry_run=True)")
+                return {
+                    'dry_run': True,
+                    'type': order_type,
+                    'ordertype': ordertype,
+                    'spice_volume': volume,
+                }
+
+            logger.info(f"[⚠️  LIVE] Placing {order_type} {ordertype} order: "
+                      f"{volume} {self.trading_pair}" +
+                      (f" @ ${price:,.2f}" if price else "") + " (dry_run=False)")
+
+            # Normalize/validate against Kraken AssetPairs rules.
             volume_norm, price_norm = self.client.normalize_order(
                 pair=self.trading_pair,
                 ordertype=ordertype,
-                volume=self.order_size,
+                volume=volume,
                 price=price,
                 current_price=price_estimate,
             )
@@ -396,6 +458,12 @@ class AdaptiveBot:
                 validate=False
             )
 
+            # Include normalized volume for downstream recording.
+            try:
+                result['spice_volume'] = float(volume_norm)
+            except Exception:
+                result['spice_volume'] = volume
+
             logger.info(f"Order placed: {result}")
             return result
 
@@ -406,6 +474,7 @@ class AdaptiveBot:
     def record_entry(self, price: float, volume: float, fee: float = 0.0, dry_run: bool = True):
         """Record entry into a position."""
         self.entry_price = price
+        self.entry_volume = volume
         self.entry_fee = fee if fee > 0 else self.fee_calculator.calculate_fee(price * volume)
 
         if self.track_fees:
@@ -495,6 +564,7 @@ class AdaptiveBot:
         self.entry_price = None
         self.entry_fee = None
         self.exit_fee = None
+        self.entry_volume = None
 
     def run_strategy(self):
         """Execute current strategy."""
@@ -504,6 +574,9 @@ class AdaptiveBot:
         market_data = self.get_market_data()
         if not market_data:
             return
+
+        # Update cached balance once per iteration (best-effort).
+        self.update_account_balance()
 
         # Update price history
         self.update_price_history(market_data)
@@ -534,7 +607,7 @@ class AdaptiveBot:
                         pair_key = self._get_pair_key(ticker_data)
                         if pair_key:
                             current_price = float(ticker_data[pair_key]['c'][0])
-                            self.record_exit(current_price, self.order_size, dry_run=self.dry_run)
+                            self.record_exit(current_price, self.entry_volume or self.order_size, dry_run=self.dry_run)
 
                     logger.info("Closing short position before going long")
                     self.place_order('buy')
@@ -542,6 +615,7 @@ class AdaptiveBot:
                 logger.info("Opening long position")
                 result = self.place_order('buy')
                 if result:
+                    used_volume = float(result.get('spice_volume', self.order_size))
                     # Get current price and record entry
                     market_data_fresh = self.get_market_data()
                     if market_data_fresh:
@@ -549,7 +623,7 @@ class AdaptiveBot:
                         pair_key = self._get_pair_key(ticker_data)
                         if pair_key:
                             current_price = float(ticker_data[pair_key]['c'][0])
-                            self.record_entry(current_price, self.order_size, dry_run=self.dry_run)
+                            self.record_entry(current_price, used_volume, dry_run=self.dry_run)
 
                     self.current_strategy.update_position('long')
                     self.current_strategy.update_signal('buy')
@@ -563,7 +637,7 @@ class AdaptiveBot:
                         pair_key = self._get_pair_key(ticker_data)
                         if pair_key:
                             current_price = float(ticker_data[pair_key]['c'][0])
-                            self.record_exit(current_price, self.order_size, dry_run=self.dry_run)
+                            self.record_exit(current_price, self.entry_volume or self.order_size, dry_run=self.dry_run)
 
                     logger.info("Closing long position before going short")
                     self.place_order('sell')
@@ -571,6 +645,7 @@ class AdaptiveBot:
                 logger.info("Opening short position")
                 result = self.place_order('sell')
                 if result:
+                    used_volume = float(result.get('spice_volume', self.order_size))
                     # Get current price and record entry
                     market_data_fresh = self.get_market_data()
                     if market_data_fresh:
@@ -578,7 +653,7 @@ class AdaptiveBot:
                         pair_key = self._get_pair_key(ticker_data)
                         if pair_key:
                             current_price = float(ticker_data[pair_key]['c'][0])
-                            self.record_entry(current_price, self.order_size, dry_run=self.dry_run)
+                            self.record_entry(current_price, used_volume, dry_run=self.dry_run)
 
                     self.current_strategy.update_position('short')
                     self.current_strategy.update_signal('sell')
@@ -651,6 +726,9 @@ def main():
     config = {
         'TRADING_PAIR': os.getenv('TRADING_PAIR', 'XBTUSD'),
         'ORDER_SIZE': os.getenv('ORDER_SIZE', '0.001'),
+        'POSITION_SIZING_MODE': os.getenv('POSITION_SIZING_MODE', 'pct'),
+        'FEE_BUFFER_PCT': os.getenv('FEE_BUFFER_PCT', '1.0'),
+        'MAX_TOTAL_EXPOSURE': os.getenv('MAX_TOTAL_EXPOSURE', '100'),
         'DRY_RUN': os.getenv('DRY_RUN', 'true'),
         'API_CALL_DELAY': os.getenv('API_CALL_DELAY', '1.0'),
 
@@ -683,6 +761,10 @@ def main():
         'AUTO_DETECT_LEVELS': os.getenv('AUTO_DETECT_LEVELS', 'true'),
         'FAST_SMA_PERIOD': os.getenv('FAST_SMA_PERIOD', '10'),
         'SLOW_SMA_PERIOD': os.getenv('SLOW_SMA_PERIOD', '30'),
+
+        # Risk / exit behavior (used by multiple strategies)
+        'MIN_PROFIT_TARGET': os.getenv('MIN_PROFIT_TARGET', '0.010'),
+        'MIN_HOLD_TIME': os.getenv('MIN_HOLD_TIME', '900'),
 
         # Fee accounting
         'MAKER_FEE': os.getenv('MAKER_FEE', '0.0016'),

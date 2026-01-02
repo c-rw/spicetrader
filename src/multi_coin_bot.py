@@ -10,6 +10,7 @@ from .kraken.client import KrakenClient
 from .coin_trader import CoinTrader
 from .database import TradingDatabase
 from .market_data import OHLCCache
+from .position_sizing import equal_split_quote_allocation
 
 # Configure logging
 import pathlib
@@ -59,6 +60,8 @@ class MultiCoinBot:
         # Position sizing
         self.max_total_exposure = float(config.get('MAX_TOTAL_EXPOSURE', 75.0))  # % of account
         self.max_per_coin = float(config.get('MAX_PER_COIN', 25.0))  # % of account
+        self.position_sizing_mode = str(config.get('POSITION_SIZING_MODE', 'pct')).strip().lower()
+        self.fee_buffer_pct = float(config.get('FEE_BUFFER_PCT', 1.0))
 
         # OHLC settings (used for indicator correctness)
         self.ohlc_interval = int(config.get('OHLC_INTERVAL', 1))
@@ -84,6 +87,8 @@ class MultiCoinBot:
         print(f"Dry Run: {self.dry_run}")
         print(f"Max Total Exposure: {self.max_total_exposure}%")
         print(f"Max Per Coin: {self.max_per_coin}%")
+        print(f"Position Sizing Mode: {self.position_sizing_mode}")
+        print(f"Fee Buffer: {self.fee_buffer_pct}%")
         print("=" * 80 + "\n")
 
     def check_connection(self) -> bool:
@@ -202,20 +207,30 @@ class MultiCoinBot:
         if not trader:
             return 0.0
 
-        # Calculate max position value for this coin
+        # Calculate max position value for this coin.
         max_coin_value = (self.account_balance * trader.max_position_pct) / 100
 
-        # Calculate how much we can allocate given total exposure limit
-        remaining_exposure = self.max_total_exposure - self.total_exposure
-        if remaining_exposure <= 0:
-            logger.warning(f"[{symbol}] Max total exposure reached ({self.total_exposure:.1f}%)")
-            return 0.0
+        # Optionally use equal-split sizing based on account balance.
+        if self.position_sizing_mode in {"equal", "equal_split", "per_coin", "dynamic"}:
+            per_coin_value = equal_split_quote_allocation(
+                self.account_balance,
+                len(self.trading_pairs),
+                fee_buffer_pct=self.fee_buffer_pct,
+                exposure_pct=self.max_total_exposure,
+            )
+            position_value = min(max_coin_value, per_coin_value)
+        else:
+            # Default: percentage-based sizing.
+            remaining_exposure = self.max_total_exposure - self.total_exposure
+            if remaining_exposure <= 0:
+                logger.warning(f"[{symbol}] Max total exposure reached ({self.total_exposure:.1f}%)")
+                return 0.0
 
-        available_pct = min(trader.max_position_pct, remaining_exposure)
-        available_value = (self.account_balance * available_pct) / 100
+            available_pct = min(trader.max_position_pct, remaining_exposure)
+            available_value = (self.account_balance * available_pct) / 100
 
-        # Use the smaller of the two limits
-        position_value = min(max_coin_value, available_value)
+            # Use the smaller of the two limits
+            position_value = min(max_coin_value, available_value)
 
         # Convert to base currency amount
         if current_price > 0:
@@ -329,10 +344,65 @@ class MultiCoinBot:
 
                 current_price = float(ticker_data[pair_key]['c'][0])
 
+                # Enforce spot-style position management: one open position per symbol.
+                # Use DB as source of truth so restarts don't strand open positions.
+                open_position = None
+                if self.db:
+                    try:
+                        open_position = self.db.get_open_position(symbol)
+                    except Exception as e:
+                        logger.warning(f"[{symbol}] Failed to fetch open position from DB: {e}")
+
                 # Calculate position size
                 position_size = self.calculate_position_size(symbol, current_price)
 
                 if position_size > 0:
+                    if signal == 'buy' and open_position:
+                        logger.info(f"[{symbol}] Skipping BUY - already have open position (id={open_position.get('id')})")
+                        continue
+
+                    if signal == 'sell' and not open_position:
+                        logger.info(f"[{symbol}] Skipping SELL - no open position (spot mode; not opening shorts)")
+                        continue
+
+                    # MACD-only exit gating (prevents fee-churn exits on tiny moves).
+                    if signal == 'sell' and open_position and str(open_position.get('strategy', '')).lower() == 'macd':
+                        try:
+                            entry_price = float(open_position['entry_price'])
+                            entry_time = open_position.get('entry_time')
+                            if isinstance(entry_time, str):
+                                try:
+                                    entry_dt = datetime.fromisoformat(entry_time)
+                                except ValueError:
+                                    entry_dt = None
+                            else:
+                                entry_dt = entry_time
+
+                            hold_seconds = (datetime.now() - entry_dt).total_seconds() if entry_dt else None
+                            gross_profit_pct = (current_price - entry_price) / entry_price
+                            taker_fee = float(self.config.get('TAKER_FEE', 0.0026))
+                            net_profit_pct = gross_profit_pct - (2.0 * taker_fee)
+
+                            min_hold_time = int(self.config.get('MIN_HOLD_TIME', 900))
+                            min_profit_target = float(self.config.get('MIN_PROFIT_TARGET', 0.010))
+
+                            # Only gate *profitable* exits. Allow loss-cut exits immediately.
+                            if net_profit_pct > 0:
+                                if hold_seconds is not None and hold_seconds < min_hold_time:
+                                    logger.info(
+                                        f"[{symbol}] MACD SELL gated (hold {int(hold_seconds)}s < {min_hold_time}s). "
+                                        f"net={net_profit_pct*100:.2f}%"
+                                    )
+                                    continue
+
+                                if net_profit_pct < min_profit_target:
+                                    logger.info(
+                                        f"[{symbol}] MACD SELL gated (net {net_profit_pct*100:.2f}% < target {min_profit_target*100:.2f}%)."
+                                    )
+                                    continue
+                        except Exception as e:
+                            logger.warning(f"[{symbol}] MACD gating check failed, proceeding: {e}")
+
                     # Place order
                     success, txid = self.place_order(symbol, signal, position_size, current_price)
 
@@ -345,25 +415,14 @@ class MultiCoinBot:
                             if actual_fee > 0:
                                 logger.info(f"[{symbol}] Actual fee retrieved: ${actual_fee:.2f}")
 
-                        # Update trader state
-                        new_position = 'long' if signal == 'buy' else 'short'
-                        old_position = trader.current_strategy.position
-
-                        # Record entry or exit for fee tracking
-                        if signal == 'buy' and old_position != 'long':
-                            # Opening long position
+                        # Record entry/exit for fee + DB tracking.
+                        if signal == 'buy':
                             trader.record_entry(current_price, position_size, fee=actual_fee, dry_run=self.dry_run)
-                        elif signal == 'sell' and old_position == 'long':
-                            # Closing long position
+                            trader.current_strategy.update_position('long')
+                        else:  # sell
                             trader.record_exit(current_price, position_size, fee=actual_fee, dry_run=self.dry_run)
-                        elif signal == 'sell' and old_position != 'short':
-                            # Opening short position
-                            trader.record_entry(current_price, position_size, fee=actual_fee, dry_run=self.dry_run)
-                        elif signal == 'buy' and old_position == 'short':
-                            # Closing short position
-                            trader.record_exit(current_price, position_size, fee=actual_fee, dry_run=self.dry_run)
+                            trader.current_strategy.update_position(None)
 
-                        trader.current_strategy.update_position(new_position)
                         trader.current_strategy.update_signal(signal)
                         trader.total_trades += 1
 
@@ -481,6 +540,8 @@ def main():
         # Position sizing
         'MAX_TOTAL_EXPOSURE': os.getenv('MAX_TOTAL_EXPOSURE', '75'),
         'MAX_PER_COIN': os.getenv('MAX_PER_COIN', '25'),
+        'POSITION_SIZING_MODE': os.getenv('POSITION_SIZING_MODE', 'equal'),
+        'FEE_BUFFER_PCT': os.getenv('FEE_BUFFER_PCT', '1.0'),
 
         # Per-coin order sizes (Optimized for profit)
         'XBTUSD_ORDER_SIZE': os.getenv('XBTUSD_ORDER_SIZE', '0.0002'),
@@ -513,6 +574,10 @@ def main():
         'MACD_FAST': os.getenv('MACD_FAST', '12'),
         'MACD_SLOW': os.getenv('MACD_SLOW', '26'),
         'MACD_SIGNAL': os.getenv('MACD_SIGNAL', '9'),
+
+        # Risk / exit behavior (used by multiple strategies)
+        'MIN_PROFIT_TARGET': os.getenv('MIN_PROFIT_TARGET', '0.010'),
+        'MIN_HOLD_TIME': os.getenv('MIN_HOLD_TIME', '900'),
 
         # Fee accounting
         'MAKER_FEE': os.getenv('MAKER_FEE', '0.0016'),
