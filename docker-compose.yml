@@ -55,8 +55,8 @@ services:
 
   spicetrader-ui:
     build:
-      context: .
-      dockerfile: ui/Dockerfile
+      context: ./ui
+      dockerfile: Dockerfile
     container_name: spicetrader-ui
     restart: unless-stopped
     environment:
