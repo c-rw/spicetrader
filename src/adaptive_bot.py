@@ -13,6 +13,7 @@ from .analysis import MarketAnalyzer, StrategySelector, MarketCondition, MarketS
 from .fee_calculator import FeeCalculator
 from .database import TradingDatabase
 from .position_sizing import equal_split_quote_allocation
+from .config_utils import ConfigError, require, require_bool, require_float, require_int
 
 # Configure logging
 import pathlib
@@ -28,6 +29,17 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not str(value).strip():
+        logger.error(
+            f"Missing required environment variable: {name}. "
+            "Set it in your .env (or Docker Compose env_file) and restart."
+        )
+        raise SystemExit(1)
+    return value
 
 
 class AdaptiveBot:
@@ -52,23 +64,23 @@ class AdaptiveBot:
         self.running = False
 
         # Extract configuration
-        self.trading_pair = config.get('TRADING_PAIR', 'XBTUSD')
-        self.order_size = float(config.get('ORDER_SIZE', 0.001))
-        self.position_sizing_mode = str(config.get('POSITION_SIZING_MODE', 'pct')).strip().lower()
-        self.fee_buffer_pct = float(config.get('FEE_BUFFER_PCT', 1.0))
-        self.max_total_exposure = float(config.get('MAX_TOTAL_EXPOSURE', 100.0))
-        self.dry_run = config.get('DRY_RUN', 'true').lower() == 'true'
-        self.api_call_delay = float(config.get('API_CALL_DELAY', 1.0))
+        self.trading_pair = str(require(config, 'TRADING_PAIR')).strip()
+        self.order_size = require_float(config, 'ORDER_SIZE')
+        self.position_sizing_mode = str(require(config, 'POSITION_SIZING_MODE')).strip().lower()
+        self.fee_buffer_pct = require_float(config, 'FEE_BUFFER_PCT')
+        self.max_total_exposure = require_float(config, 'MAX_TOTAL_EXPOSURE')
+        self.dry_run = require_bool(config, 'DRY_RUN')
+        self.api_call_delay = require_float(config, 'API_CALL_DELAY')
 
         # OHLC settings (used for indicator correctness)
-        self.ohlc_interval = int(config.get('OHLC_INTERVAL', 1))
+        self.ohlc_interval = require_int(config, 'OHLC_INTERVAL')
         self.ohlc_cache = OHLCCache(interval=self.ohlc_interval, maxlen=200)
 
         # Adaptive settings
-        self.reanalysis_interval = int(config.get('REANALYSIS_INTERVAL', 1800))  # 30 min default
-        self.switch_cooldown = int(config.get('SWITCH_COOLDOWN', 3600))  # 1 hour default
-        self.confirmations_required = int(config.get('CONFIRMATIONS_REQUIRED', 3))
-        self.max_switches_per_day = int(config.get('MAX_SWITCHES_PER_DAY', 4))
+        self.reanalysis_interval = require_int(config, 'REANALYSIS_INTERVAL')
+        self.switch_cooldown = require_int(config, 'SWITCH_COOLDOWN')
+        self.confirmations_required = require_int(config, 'CONFIRMATIONS_REQUIRED')
+        self.max_switches_per_day = require_int(config, 'MAX_SWITCHES_PER_DAY')
 
         # Initialize analyzer and selector
         self.analyzer = MarketAnalyzer(config)
@@ -107,10 +119,10 @@ class AdaptiveBot:
 
         # Fee tracking
         self.fee_calculator = FeeCalculator(
-            maker_fee=float(config.get('MAKER_FEE', 0.0016)),
-            taker_fee=float(config.get('TAKER_FEE', 0.0026))
+            maker_fee=require_float(config, 'MAKER_FEE'),
+            taker_fee=require_float(config, 'TAKER_FEE')
         )
-        self.track_fees = config.get('TRACK_FEES', 'true').lower() == 'true'
+        self.track_fees = require_bool(config, 'TRACK_FEES')
         self.cumulative_fees = 0.0
         self.total_trades = 0
         self.net_pnl = 0.0
@@ -670,7 +682,7 @@ class AdaptiveBot:
         logger.info("=" * 80)
         logger.info("DRY RUN CONFIGURATION")
         logger.info("=" * 80)
-        logger.info(f"Environment Variable DRY_RUN: {os.getenv('DRY_RUN', 'true')}")
+        logger.info(f"Environment Variable DRY_RUN: {os.getenv('DRY_RUN')}")
         logger.info(f"Bot dry_run setting: {self.dry_run}")
         if self.dry_run:
             logger.info("Mode: 🔸 DRY RUN MODE - NO REAL TRADES WILL BE EXECUTED")
@@ -715,68 +727,18 @@ def main():
     load_dotenv()
 
     # Get API credentials
-    api_key = os.getenv('KRAKEN_API_KEY')
-    api_secret = os.getenv('KRAKEN_API_SECRET')
+    api_key = _require_env('KRAKEN_API_KEY')
+    api_secret = _require_env('KRAKEN_API_SECRET')
 
-    if not api_key or not api_secret:
-        logger.error("API credentials not found.")
+    # Env-pass-through config: everything comes from environment.
+    config = dict(os.environ)
+
+    try:
+        bot = AdaptiveBot(api_key, api_secret, config)
+        bot.start()
+    except ConfigError as e:
+        logger.error(str(e))
         raise SystemExit(1)
-
-    # Load configuration
-    config = {
-        'TRADING_PAIR': os.getenv('TRADING_PAIR', 'XBTUSD'),
-        'ORDER_SIZE': os.getenv('ORDER_SIZE', '0.001'),
-        'POSITION_SIZING_MODE': os.getenv('POSITION_SIZING_MODE', 'pct'),
-        'FEE_BUFFER_PCT': os.getenv('FEE_BUFFER_PCT', '1.0'),
-        'MAX_TOTAL_EXPOSURE': os.getenv('MAX_TOTAL_EXPOSURE', '100'),
-        'DRY_RUN': os.getenv('DRY_RUN', 'true'),
-        'API_CALL_DELAY': os.getenv('API_CALL_DELAY', '1.0'),
-
-        # Adaptive settings
-        'REANALYSIS_INTERVAL': os.getenv('REANALYSIS_INTERVAL', '1800'),
-        'SWITCH_COOLDOWN': os.getenv('SWITCH_COOLDOWN', '3600'),
-        'CONFIRMATIONS_REQUIRED': os.getenv('CONFIRMATIONS_REQUIRED', '3'),
-        'MAX_SWITCHES_PER_DAY': os.getenv('MAX_SWITCHES_PER_DAY', '4'),
-
-        # Market analyzer thresholds
-        'ADX_STRONG_TREND': os.getenv('ADX_STRONG_TREND', '25'),
-        'ADX_WEAK_TREND': os.getenv('ADX_WEAK_TREND', '20'),
-        'CHOPPINESS_CHOPPY': os.getenv('CHOPPINESS_CHOPPY', '61.8'),
-        'CHOPPINESS_TRENDING': os.getenv('CHOPPINESS_TRENDING', '38.2'),
-        'RANGE_TIGHT': os.getenv('RANGE_TIGHT', '5'),
-        'RANGE_MODERATE': os.getenv('RANGE_MODERATE', '15'),
-
-        # Strategy parameters
-        'RSI_PERIOD': os.getenv('RSI_PERIOD', '14'),
-        'RSI_OVERSOLD': os.getenv('RSI_OVERSOLD', '40'),
-        'RSI_OVERBOUGHT': os.getenv('RSI_OVERBOUGHT', '60'),
-        'BB_PERIOD': os.getenv('BB_PERIOD', '20'),
-        'BB_STD_DEV': os.getenv('BB_STD_DEV', '2.0'),
-        'SUPPORT_LEVEL': os.getenv('SUPPORT_LEVEL', '96000'),
-        'RESISTANCE_LEVEL': os.getenv('RESISTANCE_LEVEL', '102000'),
-        'SUPPORT_ZONE': os.getenv('SUPPORT_ZONE', '3000'),
-        'RESISTANCE_ZONE': os.getenv('RESISTANCE_ZONE', '3000'),
-        'BREAKOUT_LOWER': os.getenv('BREAKOUT_LOWER', '93000'),
-        'BREAKOUT_UPPER': os.getenv('BREAKOUT_UPPER', '106000'),
-        'AUTO_DETECT_LEVELS': os.getenv('AUTO_DETECT_LEVELS', 'true'),
-        'FAST_SMA_PERIOD': os.getenv('FAST_SMA_PERIOD', '10'),
-        'SLOW_SMA_PERIOD': os.getenv('SLOW_SMA_PERIOD', '30'),
-
-        # Risk / exit behavior (used by multiple strategies)
-        'MIN_PROFIT_TARGET': os.getenv('MIN_PROFIT_TARGET', '0.010'),
-        'MIN_HOLD_TIME': os.getenv('MIN_HOLD_TIME', '900'),
-
-        # Fee accounting
-        'MAKER_FEE': os.getenv('MAKER_FEE', '0.0016'),
-        'TAKER_FEE': os.getenv('TAKER_FEE', '0.0026'),
-        'TRACK_FEES': os.getenv('TRACK_FEES', 'true'),
-        'MIN_PROFIT_PERCENT': os.getenv('MIN_PROFIT_PERCENT', '0.005'),
-        'SKIP_UNPROFITABLE_TRADES': os.getenv('SKIP_UNPROFITABLE_TRADES', 'true'),
-    }
-
-    # Create and start bot
-    bot = AdaptiveBot(api_key, api_secret, config)
-    bot.start()
 
 
 if __name__ == '__main__':

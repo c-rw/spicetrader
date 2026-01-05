@@ -3,6 +3,8 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List
 from collections import deque
 
+from ..config_utils import require_int
+
 
 class TradingStrategy(ABC):
     """Abstract base class for trading strategies."""
@@ -15,7 +17,7 @@ class TradingStrategy(ABC):
             config: Strategy configuration dictionary
         """
         self.config = config
-        self.price_history: deque = deque(maxlen=config.get('HISTORY_SIZE', 100))
+        self.price_history: deque = deque(maxlen=require_int(config, 'HISTORY_SIZE'))
         self.position = None  # None, 'long', or 'short'
         self.last_signal = None
         self.market_state = None  # Current market state (e.g., 'strong_uptrend', 'strong_downtrend')

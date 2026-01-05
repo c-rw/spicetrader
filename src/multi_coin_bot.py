@@ -11,21 +11,40 @@ from .coin_trader import CoinTrader
 from .database import TradingDatabase
 from .market_data import OHLCCache
 from .position_sizing import equal_split_quote_allocation
+from .config_utils import ConfigError, require, require_bool, require_float, require_int
 
 # Configure logging
 import pathlib
 log_dir = pathlib.Path(__file__).parent.parent / 'logs'
 log_dir.mkdir(exist_ok=True)
 
+handlers = [logging.StreamHandler()]
+try:
+    handlers.append(logging.FileHandler(log_dir / 'multi_coin_bot.log'))
+except OSError:
+    # Avoid crashing on import/startup when the logs dir isn't writable (e.g. host perms).
+    pass
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(log_dir / 'multi_coin_bot.log')
-    ]
+    handlers=handlers,
 )
 logger = logging.getLogger(__name__)
+
+if len(handlers) == 1:
+    logger.warning("Log file is not writable; falling back to console logging only")
+
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or not str(value).strip():
+        logger.error(
+            f"Missing required environment variable: {name}. "
+            "Set it in your .env (or Docker Compose env_file) and restart."
+        )
+        raise SystemExit(1)
+    return value
 
 
 class MultiCoinBot:
@@ -50,21 +69,23 @@ class MultiCoinBot:
         self.running = False
 
         # Parse trading pairs
-        trading_pairs_str = config.get('TRADING_PAIRS', 'XBTUSD')
-        self.trading_pairs = [pair.strip() for pair in trading_pairs_str.split(',')]
+        trading_pairs_str = str(require(config, 'TRADING_PAIRS')).strip()
+        self.trading_pairs = [pair.strip() for pair in trading_pairs_str.split(',') if pair.strip()]
+        if not self.trading_pairs:
+            raise ValueError("TRADING_PAIRS must contain at least one comma-separated pair")
 
         # Bot settings
-        self.dry_run = config.get('DRY_RUN', 'true').lower() == 'true'
-        self.api_call_delay = float(config.get('API_CALL_DELAY', 2.0))
+        self.dry_run = require_bool(config, 'DRY_RUN')
+        self.api_call_delay = require_float(config, 'API_CALL_DELAY')
 
         # Position sizing
-        self.max_total_exposure = float(config.get('MAX_TOTAL_EXPOSURE', 75.0))  # % of account
-        self.max_per_coin = float(config.get('MAX_PER_COIN', 25.0))  # % of account
-        self.position_sizing_mode = str(config.get('POSITION_SIZING_MODE', 'pct')).strip().lower()
-        self.fee_buffer_pct = float(config.get('FEE_BUFFER_PCT', 1.0))
+        self.max_total_exposure = require_float(config, 'MAX_TOTAL_EXPOSURE')  # % of account
+        self.max_per_coin = require_float(config, 'MAX_PER_COIN')  # % of account
+        self.position_sizing_mode = str(require(config, 'POSITION_SIZING_MODE')).strip().lower()
+        self.fee_buffer_pct = require_float(config, 'FEE_BUFFER_PCT')
 
         # OHLC settings (used for indicator correctness)
-        self.ohlc_interval = int(config.get('OHLC_INTERVAL', 1))
+        self.ohlc_interval = require_int(config, 'OHLC_INTERVAL')
         self.ohlc_cache = OHLCCache(interval=self.ohlc_interval, maxlen=200)
 
         # Initialize database
@@ -145,6 +166,20 @@ class MultiCoinBot:
             ticker_data = self.client.get_ticker(pair_string)
             timestamp = time.time()
 
+            # Resolve Kraken's internal pair keys (e.g., XDGUSD, XXBTZUSD) via AssetPairs altname.
+            # This keeps batch mode working for symbols beyond the hard-coded variations.
+            altname_to_key: Dict[str, str] = {}
+            try:
+                asset_pairs = self.client.get_tradable_pairs(pair_string)
+                if isinstance(asset_pairs, dict):
+                    for k, info in asset_pairs.items():
+                        if isinstance(info, dict):
+                            alt = info.get('altname')
+                            if isinstance(alt, str) and alt:
+                                altname_to_key[alt] = k
+            except Exception as e:
+                logger.debug(f"AssetPairs lookup failed (batch): {e}")
+
             # Debug: log what Kraken returned
             logger.debug(f"Kraken batch response keys: {list(ticker_data.keys())}")
 
@@ -157,20 +192,25 @@ class MultiCoinBot:
                 except Exception as e:
                     logger.debug(f"[{symbol}] OHLC update failed (batch): {e}")
 
-                # Try exact match first, then try Kraken variations
+                # Try exact match first, then try AssetPairs altname mapping, then common legacy variations.
                 key = symbol
+                variations: List[str] = []
                 if symbol not in ticker_data:
-                    # Try common Kraken variations
-                    variations = [
-                        symbol.replace('XBT', 'XXBT').replace('USD', 'ZUSD'),
-                        symbol.replace('ETH', 'XETH').replace('USD', 'ZUSD'),
-                        symbol.replace('XRP', 'XXRP').replace('USD', 'ZUSD'),
-                        symbol.replace('XMR', 'XXMR').replace('USD', 'ZUSD'),
-                    ]
-                    for variation in variations:
-                        if variation in ticker_data:
-                            key = variation
-                            break
+                    mapped = altname_to_key.get(symbol)
+                    if mapped and mapped in ticker_data:
+                        key = mapped
+                    else:
+                        # Try common Kraken variations (legacy hard-coded cases).
+                        variations = [
+                            symbol.replace('XBT', 'XXBT').replace('USD', 'ZUSD'),
+                            symbol.replace('ETH', 'XETH').replace('USD', 'ZUSD'),
+                            symbol.replace('XRP', 'XXRP').replace('USD', 'ZUSD'),
+                            symbol.replace('XMR', 'XXMR').replace('USD', 'ZUSD'),
+                        ]
+                        for variation in variations:
+                            if variation in ticker_data:
+                                key = variation
+                                break
 
                 # Only include if we found data
                 if key in ticker_data:
@@ -180,7 +220,10 @@ class MultiCoinBot:
                         'timestamp': timestamp,
                     }
                 else:
-                    logger.warning(f"[{symbol}] Not found in Kraken response (tried: {symbol}, {variations})")
+                    mapped = altname_to_key.get(symbol)
+                    logger.warning(
+                        f"[{symbol}] Not found in Kraken response (tried: {symbol}, mapped={mapped}, variations={variations})"
+                    )
 
             if not result:
                 logger.error(f"No symbols found in Kraken response. Available: {list(ticker_data.keys())}")
@@ -380,11 +423,11 @@ class MultiCoinBot:
 
                             hold_seconds = (datetime.now() - entry_dt).total_seconds() if entry_dt else None
                             gross_profit_pct = (current_price - entry_price) / entry_price
-                            taker_fee = float(self.config.get('TAKER_FEE', 0.0026))
+                            taker_fee = float(self.config['TAKER_FEE'])
                             net_profit_pct = gross_profit_pct - (2.0 * taker_fee)
 
-                            min_hold_time = int(self.config.get('MIN_HOLD_TIME', 900))
-                            min_profit_target = float(self.config.get('MIN_PROFIT_TARGET', 0.010))
+                            min_hold_time = int(self.config['MIN_HOLD_TIME'])
+                            min_profit_target = float(self.config['MIN_PROFIT_TARGET'])
 
                             # Only gate *profitable* exits. Allow loss-cut exits immediately.
                             if net_profit_pct > 0:
@@ -474,7 +517,7 @@ class MultiCoinBot:
         logger.info("=" * 80)
         logger.info("DRY RUN CONFIGURATION")
         logger.info("=" * 80)
-        logger.info(f"Environment Variable DRY_RUN: {os.getenv('DRY_RUN', 'true')}")
+        logger.info(f"Environment Variable DRY_RUN: {os.getenv('DRY_RUN')}")
         logger.info(f"Bot dry_run setting: {self.dry_run}")
         if self.dry_run:
             logger.info("Mode: 🔸 DRY RUN MODE - NO REAL TRADES WILL BE EXECUTED")
@@ -524,72 +567,20 @@ def main():
     """Main entry point."""
     load_dotenv()
 
-    api_key = os.getenv('KRAKEN_API_KEY')
-    api_secret = os.getenv('KRAKEN_API_SECRET')
+    api_key = _require_env('KRAKEN_API_KEY')
+    api_secret = _require_env('KRAKEN_API_SECRET')
 
-    if not api_key or not api_secret:
-        logger.error("API credentials not found")
+    # Env-pass-through config: everything comes from environment.
+    # Missing required keys will fail fast via config_utils.require_* when accessed.
+    _require_env('TRADING_PAIRS')
+    config = dict(os.environ)
+
+    try:
+        bot = MultiCoinBot(api_key, api_secret, config)
+        bot.start()
+    except ConfigError as e:
+        logger.error(str(e))
         raise SystemExit(1)
-
-    # Load configuration
-    config = {
-        'TRADING_PAIRS': os.getenv('TRADING_PAIRS', 'XBTUSD,ETHUSD,SOLUSD,XRPUSD'),
-        'DRY_RUN': os.getenv('DRY_RUN', 'true'),
-        'API_CALL_DELAY': os.getenv('API_CALL_DELAY', '3.0'),  # Safe for Starter tier with 4 coins
-
-        # Position sizing
-        'MAX_TOTAL_EXPOSURE': os.getenv('MAX_TOTAL_EXPOSURE', '75'),
-        'MAX_PER_COIN': os.getenv('MAX_PER_COIN', '25'),
-        'POSITION_SIZING_MODE': os.getenv('POSITION_SIZING_MODE', 'equal'),
-        'FEE_BUFFER_PCT': os.getenv('FEE_BUFFER_PCT', '1.0'),
-
-        # Per-coin order sizes (Optimized for profit)
-        'XBTUSD_ORDER_SIZE': os.getenv('XBTUSD_ORDER_SIZE', '0.0002'),
-        'ETHUSD_ORDER_SIZE': os.getenv('ETHUSD_ORDER_SIZE', '0.02'),
-        'SOLUSD_ORDER_SIZE': os.getenv('SOLUSD_ORDER_SIZE', '0.2'),
-        'XRPUSD_ORDER_SIZE': os.getenv('XRPUSD_ORDER_SIZE', '75.0'),
-
-        # Adaptive settings (shared across all coins)
-        'REANALYSIS_INTERVAL': os.getenv('REANALYSIS_INTERVAL', '3600'),
-        'SWITCH_COOLDOWN': os.getenv('SWITCH_COOLDOWN', '3600'),
-        'CONFIRMATIONS_REQUIRED': os.getenv('CONFIRMATIONS_REQUIRED', '3'),
-        'MAX_SWITCHES_PER_DAY': os.getenv('MAX_SWITCHES_PER_DAY', '4'),
-
-        # Market analyzer settings
-        'ADX_STRONG_TREND': os.getenv('ADX_STRONG_TREND', '25'),
-        'ADX_WEAK_TREND': os.getenv('ADX_WEAK_TREND', '20'),
-        'CHOPPINESS_CHOPPY': os.getenv('CHOPPINESS_CHOPPY', '61.8'),
-        'CHOPPINESS_TRENDING': os.getenv('CHOPPINESS_TRENDING', '38.2'),
-        'RANGE_TIGHT': os.getenv('RANGE_TIGHT', '5'),
-        'RANGE_MODERATE': os.getenv('RANGE_MODERATE', '15'),
-
-        # Strategy parameters
-        'RSI_PERIOD': os.getenv('RSI_PERIOD', '14'),
-        'RSI_OVERSOLD': os.getenv('RSI_OVERSOLD', '40'),
-        'RSI_OVERBOUGHT': os.getenv('RSI_OVERBOUGHT', '60'),
-        'BB_PERIOD': os.getenv('BB_PERIOD', '20'),
-        'BB_STD_DEV': os.getenv('BB_STD_DEV', '2.0'),
-        'FAST_SMA_PERIOD': os.getenv('FAST_SMA_PERIOD', '10'),
-        'SLOW_SMA_PERIOD': os.getenv('SLOW_SMA_PERIOD', '30'),
-        'MACD_FAST': os.getenv('MACD_FAST', '12'),
-        'MACD_SLOW': os.getenv('MACD_SLOW', '26'),
-        'MACD_SIGNAL': os.getenv('MACD_SIGNAL', '9'),
-
-        # Risk / exit behavior (used by multiple strategies)
-        'MIN_PROFIT_TARGET': os.getenv('MIN_PROFIT_TARGET', '0.010'),
-        'MIN_HOLD_TIME': os.getenv('MIN_HOLD_TIME', '900'),
-
-        # Fee accounting
-        'MAKER_FEE': os.getenv('MAKER_FEE', '0.0016'),
-        'TAKER_FEE': os.getenv('TAKER_FEE', '0.0026'),
-        'TRACK_FEES': os.getenv('TRACK_FEES', 'true'),
-        'MIN_PROFIT_PERCENT': os.getenv('MIN_PROFIT_PERCENT', '0.005'),
-        'SKIP_UNPROFITABLE_TRADES': os.getenv('SKIP_UNPROFITABLE_TRADES', 'true'),
-    }
-
-    # Create and start bot
-    bot = MultiCoinBot(api_key, api_secret, config)
-    bot.start()
 
 
 if __name__ == '__main__':

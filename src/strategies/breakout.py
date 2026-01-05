@@ -10,6 +10,7 @@ from ..indicators import (
     calculate_fibonacci_extensions,
     is_near_fibonacci_level
 )
+from ..config_utils import require_bool, require_float, require_int
 
 logger = logging.getLogger(__name__)
 
@@ -37,13 +38,13 @@ class BreakoutStrategy(TradingStrategy):
         super().__init__(config)
 
         # Breakout parameters
-        self.atr_period = int(config.get('ATR_PERIOD', 14))
-        self.atr_multiplier = float(config.get('ATR_MULTIPLIER', 1.5))
-        self.volume_threshold = float(config.get('VOLUME_THRESHOLD', 1.5))
-        self.lookback_period = int(config.get('BREAKOUT_LOOKBACK', 20))
+        self.atr_period = require_int(config, 'ATR_PERIOD')
+        self.atr_multiplier = require_float(config, 'ATR_MULTIPLIER')
+        self.volume_threshold = require_float(config, 'VOLUME_THRESHOLD')
+        self.lookback_period = require_int(config, 'BREAKOUT_LOOKBACK')
 
         # Retest confirmation
-        self.require_retest = config.get('REQUIRE_RETEST', 'false').lower() == 'true'
+        self.require_retest = require_bool(config, 'REQUIRE_RETEST')
 
         # Track breakout levels
         self.last_resistance = None
@@ -55,8 +56,8 @@ class BreakoutStrategy(TradingStrategy):
         self.volume_history = []
 
         # Fibonacci analysis settings (for profit targets)
-        self.use_fibonacci = config.get('USE_FIBONACCI', 'true').lower() == 'true'
-        self.fib_lookback_period = int(config.get('FIB_LOOKBACK_PERIOD', 50))
+        self.use_fibonacci = require_bool(config, 'USE_FIBONACCI')
+        self.fib_lookback_period = require_int(config, 'FIB_LOOKBACK_PERIOD')
 
         logger.info(f"Breakout Strategy initialized:")
         logger.info(f"  ATR Period: {self.atr_period}, Multiplier: {self.atr_multiplier}x")
