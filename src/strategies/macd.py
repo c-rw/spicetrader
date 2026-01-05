@@ -3,6 +3,7 @@ import logging
 from typing import Optional, Dict, Any
 from .base import TradingStrategy
 from ..indicators import calculate_macd
+from ..config_utils import require_bool, require_int
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +31,12 @@ class MACDStrategy(TradingStrategy):
         super().__init__(config)
 
         # MACD parameters
-        self.fast_period = int(config.get('MACD_FAST', 12))
-        self.slow_period = int(config.get('MACD_SLOW', 26))
-        self.signal_period = int(config.get('MACD_SIGNAL', 9))
+        self.fast_period = require_int(config, 'MACD_FAST')
+        self.slow_period = require_int(config, 'MACD_SLOW')
+        self.signal_period = require_int(config, 'MACD_SIGNAL')
 
         # Histogram confirmation
-        self.require_histogram_confirm = config.get('MACD_HISTOGRAM_CONFIRM', 'true').lower() == 'true'
+        self.require_histogram_confirm = require_bool(config, 'MACD_HISTOGRAM_CONFIRM')
 
         # Track previous MACD values for crossover detection
         self.prev_macd_line = None

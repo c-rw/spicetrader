@@ -2,6 +2,7 @@
 import logging
 from typing import Optional, Dict, Any, List
 from .base import TradingStrategy
+from ..config_utils import require_float, require_int
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,8 @@ class GridTradingStrategy(TradingStrategy):
         super().__init__(config)
 
         # Grid parameters
-        self.grid_size = int(config.get('GRID_SIZE', 10))  # Number of grid levels
-        self.grid_spacing_pct = float(config.get('GRID_SPACING_PCT', 0.5))  # 0.5% spacing
+        self.grid_size = require_int(config, 'GRID_SIZE')
+        self.grid_spacing_pct = require_float(config, 'GRID_SPACING_PCT')
         self.grid_center = None  # Will be set based on current price
 
         # Track grid levels and orders

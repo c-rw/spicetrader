@@ -2,6 +2,7 @@
 import logging
 from typing import Optional, Dict, Any
 from .base import TradingStrategy
+from ..config_utils import optional, require_bool, require_float, require_int
 from ..indicators import (
     calculate_rsi,
     calculate_bollinger_bands,
@@ -43,40 +44,62 @@ class MeanReversionStrategy(TradingStrategy):
         prefix = f'{symbol}_' if symbol else ''
 
         # RSI parameters
-        self.rsi_period = int(config.get('RSI_PERIOD', 14))
-        self.rsi_oversold = float(config.get('RSI_OVERSOLD', 40))
-        self.rsi_overbought = float(config.get('RSI_OVERBOUGHT', 60))
+        self.rsi_period = require_int(config, 'RSI_PERIOD')
+        self.rsi_oversold = require_float(config, 'RSI_OVERSOLD')
+        self.rsi_overbought = require_float(config, 'RSI_OVERBOUGHT')
 
         # Bollinger Bands parameters
-        self.bb_period = int(config.get('BB_PERIOD', 20))
-        self.bb_std_dev = float(config.get('BB_STD_DEV', 2.0))
+        self.bb_period = require_int(config, 'BB_PERIOD')
+        self.bb_std_dev = require_float(config, 'BB_STD_DEV')
 
         # Range parameters - USE PER-COIN CONFIG
         # Default values based on symbol if not configured
         default_support, default_resistance, default_lower, default_upper = self._get_default_levels(symbol)
 
-        self.support_level = float(config.get(f'{prefix}SUPPORT_LEVEL', default_support))
-        self.resistance_level = float(config.get(f'{prefix}RESISTANCE_LEVEL', default_resistance))
-        self.support_zone = float(config.get(f'{prefix}SUPPORT_ZONE',
-                                             config.get('SUPPORT_ZONE', self.support_level * 0.03)))  # 3% default
-        self.resistance_zone = float(config.get(f'{prefix}RESISTANCE_ZONE',
-                                                config.get('RESISTANCE_ZONE', self.resistance_level * 0.03)))
+        support_raw = optional(config, f'{prefix}SUPPORT_LEVEL')
+        if support_raw is None:
+            support_raw = optional(config, 'SUPPORT_LEVEL')
+        self.support_level = float(support_raw) if support_raw is not None else float(default_support)
+
+        resistance_raw = optional(config, f'{prefix}RESISTANCE_LEVEL')
+        if resistance_raw is None:
+            resistance_raw = optional(config, 'RESISTANCE_LEVEL')
+        self.resistance_level = float(resistance_raw) if resistance_raw is not None else float(default_resistance)
+
+        support_zone_raw = optional(config, f'{prefix}SUPPORT_ZONE')
+        if support_zone_raw is None:
+            support_zone_raw = optional(config, 'SUPPORT_ZONE')
+        self.support_zone = float(support_zone_raw) if support_zone_raw is not None else float(self.support_level * 0.03)
+
+        resistance_zone_raw = optional(config, f'{prefix}RESISTANCE_ZONE')
+        if resistance_zone_raw is None:
+            resistance_zone_raw = optional(config, 'RESISTANCE_ZONE')
+        self.resistance_zone = float(resistance_zone_raw) if resistance_zone_raw is not None else float(self.resistance_level * 0.03)
 
         # Breakout detection - USE PER-COIN CONFIG
-        self.breakout_lower = float(config.get(f'{prefix}BREAKOUT_LOWER', default_lower))
-        self.breakout_upper = float(config.get(f'{prefix}BREAKOUT_UPPER', default_upper))
+        breakout_lower_raw = optional(config, f'{prefix}BREAKOUT_LOWER')
+        if breakout_lower_raw is None:
+            breakout_lower_raw = optional(config, 'BREAKOUT_LOWER')
+        self.breakout_lower = float(breakout_lower_raw) if breakout_lower_raw is not None else float(default_lower)
+
+        breakout_upper_raw = optional(config, f'{prefix}BREAKOUT_UPPER')
+        if breakout_upper_raw is None:
+            breakout_upper_raw = optional(config, 'BREAKOUT_UPPER')
+        self.breakout_upper = float(breakout_upper_raw) if breakout_upper_raw is not None else float(default_upper)
 
         # Dynamic support/resistance detection
-        self.auto_detect_levels = config.get('AUTO_DETECT_LEVELS', 'true').lower() == 'true'
+        self.auto_detect_levels = require_bool(config, 'AUTO_DETECT_LEVELS')
 
         # Fibonacci analysis settings
-        self.use_fibonacci = config.get('USE_FIBONACCI', 'true').lower() == 'true'
-        self.fib_lookback_period = int(config.get('FIB_LOOKBACK_PERIOD', 50))
-        self.fib_tolerance = float(config.get('FIB_TOLERANCE', 1.0))
+        self.use_fibonacci = require_bool(config, 'USE_FIBONACCI')
+        self.fib_lookback_period = require_int(config, 'FIB_LOOKBACK_PERIOD')
+        self.fib_tolerance = require_float(config, 'FIB_TOLERANCE')
 
         # Profit target settings (CRITICAL FIX)
-        self.min_profit_target = float(config.get(f'{prefix}MIN_PROFIT_TARGET',
-                                                  config.get('MIN_PROFIT_TARGET', 0.006)))  # 0.6% default
+        min_profit_raw = optional(config, f'{prefix}MIN_PROFIT_TARGET')
+        if min_profit_raw is None:
+            min_profit_raw = require_float(config, 'MIN_PROFIT_TARGET')
+        self.min_profit_target = float(min_profit_raw)
         self.entry_price = None  # Track entry price for profit calculation
 
         logger.info(f"Mean Reversion Strategy initialized for {symbol or 'default'}:")
@@ -106,7 +129,45 @@ class MeanReversionStrategy(TradingStrategy):
             'XRPUSD': (2.15, 2.35, 2.05, 2.45),
         }
 
-        return defaults.get(symbol, (94000, 102000, 93000, 106000))
+        # For unknown symbols (e.g. PEPE/DOGE/ARB), avoid BTC-sized defaults.
+        # These get initialized from price history when AUTO_DETECT_LEVELS=true.
+        return defaults.get(symbol, (0.0, 0.0, 0.0, float('inf')))
+
+    def _ensure_levels_initialized(self, prices: list, current_price: float) -> None:
+        """Seed support/resistance/breakout levels from recent prices.
+
+        This keeps the strategy usable for low-priced assets when relying on auto-detection.
+        """
+        if not prices or current_price <= 0:
+            return
+
+        # If levels already look sane and ordered, keep them.
+        if self.support_level > 0 and self.resistance_level > 0 and self.support_level < self.resistance_level:
+            return
+
+        window = prices[-200:] if len(prices) >= 200 else prices
+        low = float(min(window))
+        high = float(max(window))
+        if low <= 0 or high <= 0 or low >= high:
+            return
+
+        self.support_level = low
+        self.resistance_level = high
+
+        # Default zones: +/- 3%.
+        if not self.support_zone or self.support_zone <= 0:
+            self.support_zone = self.support_level * 0.03
+        if not self.resistance_zone or self.resistance_zone <= 0:
+            self.resistance_zone = self.resistance_level * 0.03
+
+        # Breakout bounds: a bit wider than range.
+        self.breakout_lower = self.support_level * 0.97
+        self.breakout_upper = self.resistance_level * 1.03
+
+        logger.info(
+            f"📊 Auto-level init ({self.symbol or 'default'}): support={self.support_level:g}, "
+            f"resistance={self.resistance_level:g}, breakout=[{self.breakout_lower:g}, {self.breakout_upper:g}]"
+        )
 
     def get_strategy_name(self) -> str:
         """Return strategy name."""
@@ -166,6 +227,10 @@ class MeanReversionStrategy(TradingStrategy):
             return None
 
         upper_bb, middle_bb, lower_bb = bb
+
+        # If we're relying on auto levels, ensure we start with sane bounds before breakout checks.
+        if self.auto_detect_levels and len(prices) >= 20:
+            self._ensure_levels_initialized(prices, current_price)
 
         # Update support/resistance if auto-detection enabled
         if self.auto_detect_levels and len(prices) >= 50:
@@ -300,16 +365,16 @@ class MeanReversionStrategy(TradingStrategy):
         Returns:
             Pair key or None
         """
-        # Common pair variations
-        variations = ['XBTUSD', 'XXBTZUSD', 'BTCUSD', 'ETHUSD', 'XETHZUSD', 'SOLUSD', 'XRPUSD', 'XXRPZUSD']
+        # Prefer the configured symbol, otherwise use the only returned key.
+        if self.symbol and self.symbol in ticker_data:
+            return self.symbol
 
-        for variation in variations:
-            if variation in ticker_data:
-                return variation
+        if isinstance(ticker_data, dict) and len(ticker_data) == 1:
+            return next(iter(ticker_data.keys()))
 
         # Return first key if none match
         if ticker_data:
-            return list(ticker_data.keys())[0]
+            return next(iter(ticker_data.keys()))
 
         return None
 
@@ -325,13 +390,28 @@ class MeanReversionStrategy(TradingStrategy):
         if support_levels:
             # Use the highest support level (closest to current price)
             new_support = max(support_levels)
-            if abs(new_support - self.support_level) > 1000:  # Significant change
-                logger.info(f"📊 Support level updated: ${self.support_level:,.0f} → ${new_support:,.0f}")
+            if self.support_level <= 0:
                 self.support_level = new_support
+                logger.info(f"📊 Support level initialized: {new_support:g}")
+            else:
+                rel = abs(new_support - self.support_level) / max(self.support_level, 1e-12)
+                if rel >= 0.01:
+                    logger.info(f"📊 Support level updated: {self.support_level:g} → {new_support:g}")
+                    self.support_level = new_support
 
         if resistance_levels:
             # Use the lowest resistance level (closest to current price)
             new_resistance = min(resistance_levels)
-            if abs(new_resistance - self.resistance_level) > 1000:  # Significant change
-                logger.info(f"📊 Resistance level updated: ${self.resistance_level:,.0f} → ${new_resistance:,.0f}")
+            if self.resistance_level <= 0:
                 self.resistance_level = new_resistance
+                logger.info(f"📊 Resistance level initialized: {new_resistance:g}")
+            else:
+                rel = abs(new_resistance - self.resistance_level) / max(self.resistance_level, 1e-12)
+                if rel >= 0.01:
+                    logger.info(f"📊 Resistance level updated: {self.resistance_level:g} → {new_resistance:g}")
+                    self.resistance_level = new_resistance
+
+        # Keep breakout bounds loosely aligned with the detected range.
+        if self.support_level > 0 and self.resistance_level > 0 and self.support_level < self.resistance_level:
+            self.breakout_lower = self.support_level * 0.97
+            self.breakout_upper = self.resistance_level * 1.03

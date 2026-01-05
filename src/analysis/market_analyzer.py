@@ -3,6 +3,8 @@ import logging
 import time
 from typing import List, Dict, Any, Optional, Tuple
 
+from ..config_utils import require_float, require_int
+
 from ..indicators import (
     calculate_adx,
     calculate_atr,
@@ -33,23 +35,23 @@ class MarketAnalyzer:
         self.config = config or {}
 
         # Thresholds for market state detection
-        self.adx_strong_trend = float(self.config.get('ADX_STRONG_TREND', 25))
-        self.adx_weak_trend = float(self.config.get('ADX_WEAK_TREND', 20))
-        self.choppiness_choppy = float(self.config.get('CHOPPINESS_CHOPPY', 61.8))
-        self.choppiness_trending = float(self.config.get('CHOPPINESS_TRENDING', 38.2))
-        self.range_tight = float(self.config.get('RANGE_TIGHT', 5))
-        self.range_moderate = float(self.config.get('RANGE_MODERATE', 15))
+        self.adx_strong_trend = require_float(self.config, 'ADX_STRONG_TREND')
+        self.adx_weak_trend = require_float(self.config, 'ADX_WEAK_TREND')
+        self.choppiness_choppy = require_float(self.config, 'CHOPPINESS_CHOPPY')
+        self.choppiness_trending = require_float(self.config, 'CHOPPINESS_TRENDING')
+        self.range_tight = require_float(self.config, 'RANGE_TIGHT')
+        self.range_moderate = require_float(self.config, 'RANGE_MODERATE')
 
         # Indicator periods
-        self.adx_period = int(self.config.get('ADX_PERIOD', 14))
-        self.atr_period = int(self.config.get('ATR_PERIOD', 14))
-        self.chop_period = int(self.config.get('CHOP_PERIOD', 14))
-        self.slope_period = int(self.config.get('SLOPE_PERIOD', 14))
-        self.range_period = int(self.config.get('RANGE_PERIOD', 50))
+        self.adx_period = require_int(self.config, 'ADX_PERIOD')
+        self.atr_period = require_int(self.config, 'ATR_PERIOD')
+        self.chop_period = require_int(self.config, 'CHOP_PERIOD')
+        self.slope_period = require_int(self.config, 'SLOPE_PERIOD')
+        self.range_period = require_int(self.config, 'RANGE_PERIOD')
 
         # Caching for analysis results (per-symbol)
         self._analysis_cache: Dict[str, Tuple[MarketCondition, float]] = {}  # symbol -> (condition, timestamp)
-        self.cache_ttl = int(self.config.get('ANALYSIS_CACHE_TTL', 30))  # Cache for 30 seconds
+        self.cache_ttl = require_int(self.config, 'ANALYSIS_CACHE_TTL')
 
         logger.info("MarketAnalyzer initialized with thresholds:")
         logger.info(f"  ADX: Strong>{self.adx_strong_trend}, Weak<{self.adx_weak_trend}")

@@ -4,6 +4,7 @@ import time
 from typing import Optional, Dict, Any
 from .base import TradingStrategy
 from ..indicators import calculate_sma
+from ..config_utils import require_bool, require_float, require_int
 
 logger = logging.getLogger(__name__)
 
@@ -33,23 +34,23 @@ class SMACrossoverStrategy(TradingStrategy):
         """
         super().__init__(config)
 
-        self.fast_period = int(config.get('FAST_SMA_PERIOD', 50))
-        self.slow_period = int(config.get('SLOW_SMA_PERIOD', 200))
+        self.fast_period = require_int(config, 'FAST_SMA_PERIOD')
+        self.slow_period = require_int(config, 'SLOW_SMA_PERIOD')
 
         # For crossover detection
         self.prev_fast_sma = None
         self.prev_slow_sma = None
 
         # Profit target checking
-        self.min_profit_target = float(config.get('MIN_PROFIT_TARGET', 0.006))  # 0.6% default
+        self.min_profit_target = require_float(config, 'MIN_PROFIT_TARGET')
         self.entry_price = None
         self.entry_time = None
 
         # Minimum hold time (seconds) to prevent whipsaws
-        self.min_hold_time = int(config.get('MIN_HOLD_TIME', 300))  # 5 minutes default
+        self.min_hold_time = require_int(config, 'MIN_HOLD_TIME')
 
         # Trend alignment filter
-        self.enable_trend_filter = config.get('ENABLE_TREND_FILTER', 'true').lower() == 'true'
+        self.enable_trend_filter = require_bool(config, 'ENABLE_TREND_FILTER')
 
         logger.info(f"SMA Crossover Strategy initialized:")
         logger.info(f"  SMAs: Fast={self.fast_period}, Slow={self.slow_period}")

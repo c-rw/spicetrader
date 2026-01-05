@@ -8,6 +8,7 @@ from collections import deque
 from .analysis import MarketAnalyzer, StrategySelector, MarketCondition
 from .fee_calculator import FeeCalculator
 from .database import TradingDatabase
+from .config_utils import optional, require_bool, require_float, require_int
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,15 @@ class CoinTrader:
         self.db = db
 
         # Extract coin-specific config
-        self.order_size = float(config.get(f'{symbol}_ORDER_SIZE', config.get('ORDER_SIZE', 0.001)))
-        self.max_position_pct = float(config.get(f'{symbol}_MAX_POSITION_PCT', 25.0))  # % of portfolio
+        order_size_raw = optional(config, f'{symbol}_ORDER_SIZE')
+        if order_size_raw is None:
+            order_size_raw = require_float(config, 'ORDER_SIZE')
+        self.order_size = float(order_size_raw)
+
+        max_position_raw = optional(config, f'{symbol}_MAX_POSITION_PCT')
+        if max_position_raw is None:
+            max_position_raw = require_float(config, 'MAX_PER_COIN')
+        self.max_position_pct = float(max_position_raw)  # % of portfolio
 
         # Initialize analyzer and selector
         self.analyzer = MarketAnalyzer(config)
@@ -67,10 +75,10 @@ class CoinTrader:
 
         # Fee tracking
         self.fee_calculator = FeeCalculator(
-            maker_fee=float(config.get('MAKER_FEE', 0.0016)),
-            taker_fee=float(config.get('TAKER_FEE', 0.0026))
+            maker_fee=require_float(config, 'MAKER_FEE'),
+            taker_fee=require_float(config, 'TAKER_FEE')
         )
-        self.track_fees = config.get('TRACK_FEES', 'true').lower() == 'true'
+        self.track_fees = require_bool(config, 'TRACK_FEES')
         self.cumulative_fees = 0.0
         self.total_volume = 0.0
         self.entry_price = None
@@ -81,10 +89,10 @@ class CoinTrader:
         self.current_position_id = None  # Track database position ID
 
         # Adaptive settings
-        self.reanalysis_interval = int(config.get('REANALYSIS_INTERVAL', 1800))
-        self.switch_cooldown = int(config.get('SWITCH_COOLDOWN', 3600))
-        self.confirmations_required = int(config.get('CONFIRMATIONS_REQUIRED', 3))
-        self.max_switches_per_day = int(config.get('MAX_SWITCHES_PER_DAY', 4))
+        self.reanalysis_interval = require_int(config, 'REANALYSIS_INTERVAL')
+        self.switch_cooldown = require_int(config, 'SWITCH_COOLDOWN')
+        self.confirmations_required = require_int(config, 'CONFIRMATIONS_REQUIRED')
+        self.max_switches_per_day = require_int(config, 'MAX_SWITCHES_PER_DAY')
 
         logger.info(f"CoinTrader initialized for {symbol}")
         logger.info(f"  Order Size: {self.order_size}")
