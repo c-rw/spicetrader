@@ -1,12 +1,41 @@
 from __future__ import annotations
 
 import os
+import secrets
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from fastapi import FastAPI, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from .db import _build_in_clause, build_filters, db_session, fetch_all, fetch_one
+
+
+# ---------------------------------------------------------------------------
+# API-key authentication
+# ---------------------------------------------------------------------------
+# Set DASHBOARD_API_KEY in the environment (or .env) to require a Bearer
+# token for all endpoints except /health.  When the key is unset, auth is
+# disabled so existing deployments keep working until the key is configured.
+
+_API_KEY: Optional[str] = os.getenv("DASHBOARD_API_KEY") or None
+
+
+def _verify_api_key(request: Request) -> None:
+    """FastAPI dependency that rejects requests without a valid API key.
+
+    Skips validation when ``DASHBOARD_API_KEY`` is not configured so the
+    dashboard remains usable during development / initial setup.
+    """
+    if _API_KEY is None:
+        return  # Auth disabled — no key configured
+
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Authorization header")
+
+    token = auth[7:]  # Strip "Bearer "
+    if not secrets.compare_digest(token, _API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid API key")
 
 
 def _coerce_datetime_str(value: Optional[str], *, default: str) -> str:
@@ -63,13 +92,14 @@ app = FastAPI(title="SpiceTrader Dashboard API", version="0.1.0")
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
+    """Unauthenticated health-check (for Docker healthcheck / load balancers)."""
     db_path = os.getenv("DB_PATH", "/app/data/trading.db")
     with db_session(db_path) as conn:
         row = fetch_one(conn, "SELECT 1 as ok", {})
         return {"ok": bool(row and row["ok"] == 1), "db_path": db_path}
 
 
-@app.get("/api/overview")
+@app.get("/api/overview", dependencies=[Depends(_verify_api_key)])
 def overview(
     start: Optional[str] = Query(default=None),
     end: Optional[str] = Query(default=None),

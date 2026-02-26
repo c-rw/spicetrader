@@ -1,9 +1,11 @@
-FROM node:20-alpine
+FROM node:20.18-alpine3.20
 
 WORKDIR /app
 
-COPY package.json /app/package.json
-RUN npm install --no-audit --no-fund
+# Copy both package.json and lockfile for reproducible installs.
+# Generate the lockfile locally with: npm install --package-lock-only
+COPY package.json package-lock.json* /app/
+RUN if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; else npm install --no-audit --no-fund; fi
 
 COPY . /app/
 

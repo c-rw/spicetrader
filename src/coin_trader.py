@@ -193,6 +193,7 @@ class CoinTrader:
     def _switch_strategy(self, market_condition: MarketCondition, new_strategy_name: str):
         """Switch to a new strategy."""
         old_strategy_name = self._get_strategy_name(self.current_strategy)
+        old_strategy = self.current_strategy
 
         logger.info(f"[{self.symbol}] 🔄 SWITCHING: {old_strategy_name} → {new_strategy_name}")
         logger.info(f"[{self.symbol}] Reason: {market_condition.description}")
@@ -204,6 +205,22 @@ class CoinTrader:
 
         # Select new strategy
         self.current_strategy = self.selector.select_strategy(market_condition, symbol=self.symbol)
+
+        # Transfer price history from old strategy so the new one doesn't start
+        # from scratch.  This avoids minutes of warmup data re-collection.
+        if old_strategy and old_strategy.price_history:
+            for price in old_strategy.price_history:
+                self.current_strategy.add_price(price)
+            logger.info(
+                f"[{self.symbol}] Transferred {len(old_strategy.price_history)} "
+                f"price points to new strategy"
+            )
+
+        # Carry over entry_price if we still have an open position tracked
+        # at the CoinTrader level (the strategy-level position was cleared above,
+        # but the DB position / CoinTrader.entry_price may still be open).
+        if self.entry_price is not None and old_strategy and old_strategy.entry_price is not None:
+            self.current_strategy.entry_price = old_strategy.entry_price
 
         # Update tracking
         self.last_switch_time = time.time()
@@ -427,7 +444,7 @@ class CoinTrader:
         if open_position and open_position.get('position_type') in ('long', 'short'):
             position_type = open_position['position_type']
         else:
-            position_type = 'long' if self.current_strategy and self.current_strategy.position == 'long' else 'long'
+            position_type = 'long' if self.current_strategy and self.current_strategy.position == 'long' else 'short'
         gross_pnl, total_fees, net_pnl = self.fee_calculator.calculate_net_pnl(
             entry_price=self.entry_price,
             exit_price=price,

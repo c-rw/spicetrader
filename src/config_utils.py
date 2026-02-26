@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional
+import logging
+from typing import Any, List, Mapping, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(ValueError):
@@ -55,3 +58,63 @@ def require_bool(config: Mapping[str, Any], key: str) -> bool:
     if normalized in {"false", "0", "no", "n", "off"}:
         return False
     raise ConfigError(f"Config key {key} must be a boolean, got {value!r}")
+
+
+# ---- Startup validation ----
+# All keys required by at least one component.  Checked once at boot so
+# missing config surfaces immediately instead of minutes into a live run.
+
+_REQUIRED_KEYS: List[str] = [
+    # Core bot
+    'DRY_RUN', 'LOG_LEVEL', 'API_CALL_DELAY',
+    # Trading
+    'ORDER_SIZE', 'MAX_TOTAL_EXPOSURE', 'MAX_PER_COIN',
+    # Shared strategy
+    'HISTORY_SIZE', 'MIN_PROFIT_TARGET',
+    # SMA Crossover
+    'FAST_SMA_PERIOD', 'SLOW_SMA_PERIOD', 'MIN_HOLD_TIME', 'ENABLE_TREND_FILTER',
+    # Mean Reversion
+    'RSI_PERIOD', 'RSI_OVERSOLD', 'RSI_OVERBOUGHT',
+    'BB_PERIOD', 'BB_STD_DEV',
+    'AUTO_DETECT_LEVELS', 'USE_FIBONACCI', 'FIB_LOOKBACK_PERIOD', 'FIB_TOLERANCE',
+    # MACD
+    'MACD_FAST', 'MACD_SLOW', 'MACD_SIGNAL', 'MACD_HISTOGRAM_CONFIRM',
+    # Breakout
+    'ATR_PERIOD', 'ATR_MULTIPLIER', 'VOLUME_THRESHOLD', 'BREAKOUT_LOOKBACK', 'REQUIRE_RETEST',
+    # Grid
+    'GRID_SIZE', 'GRID_SPACING_PCT',
+    # Market analyzer / adaptive
+    'ADX_STRONG_TREND', 'ADX_WEAK_TREND',
+    'CHOPPINESS_CHOPPY', 'CHOPPINESS_TRENDING',
+    'RANGE_TIGHT', 'RANGE_MODERATE',
+    'ADX_PERIOD', 'CHOP_PERIOD', 'SLOPE_PERIOD', 'RANGE_PERIOD',
+    'ANALYSIS_CACHE_TTL',
+    'REANALYSIS_INTERVAL', 'SWITCH_COOLDOWN', 'CONFIRMATIONS_REQUIRED', 'MAX_SWITCHES_PER_DAY',
+    # Fees
+    'MAKER_FEE', 'TAKER_FEE', 'TRACK_FEES',
+]
+
+
+def validate_config(config: Mapping[str, Any]) -> List[str]:
+    """Validate that all required config keys are present.
+
+    Args:
+        config: Configuration mapping (typically ``dict(os.environ)``).
+
+    Returns:
+        List of missing key names (empty if all present).
+
+    Raises:
+        ConfigError: If any required keys are missing.
+    """
+    missing = [key for key in _REQUIRED_KEYS if key not in config or _is_blank(config.get(key))]
+
+    if missing:
+        msg = (
+            f"Missing {len(missing)} required config key(s): {', '.join(sorted(missing))}. "
+            "Copy .env.example to .env and fill in all values."
+        )
+        logger.error(msg)
+        raise ConfigError(msg)
+
+    return missing

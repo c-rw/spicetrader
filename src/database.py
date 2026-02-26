@@ -365,7 +365,8 @@ class TradingDatabase:
 
         total_fees = position['entry_fee'] + exit_fee
         net_pnl = gross_pnl - total_fees
-        pnl_percent = (net_pnl / (position['entry_price'] * position['entry_volume'])) * 100
+        cost_basis = position['entry_price'] * position['entry_volume']
+        pnl_percent = (net_pnl / cost_basis) * 100 if cost_basis > 0 else 0.0
 
         # Update position
         cursor.execute("""

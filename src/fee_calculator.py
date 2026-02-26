@@ -91,9 +91,9 @@ class FeeCalculator:
         """
         # Calculate gross profit %
         if position_type == 'long':
-            gross_profit_pct = (exit_price - entry_price) / entry_price
+            gross_profit_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0.0
         else:  # short
-            gross_profit_pct = (entry_price - exit_price) / entry_price
+            gross_profit_pct = (entry_price - exit_price) / entry_price if entry_price > 0 else 0.0
 
         # Subtract fees
         fee_rate = self.maker_fee if is_maker else self.taker_fee

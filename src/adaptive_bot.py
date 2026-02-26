@@ -13,7 +13,7 @@ from .analysis import MarketAnalyzer, StrategySelector, MarketCondition, MarketS
 from .fee_calculator import FeeCalculator
 from .database import TradingDatabase
 from .position_sizing import equal_split_quote_allocation
-from .config_utils import ConfigError, require, require_bool, require_float, require_int
+from .config_utils import ConfigError, require, require_bool, require_float, require_int, validate_config
 
 # Configure logging
 import pathlib
@@ -622,7 +622,10 @@ class AdaptiveBot:
                             self.record_exit(current_price, self.entry_volume or self.order_size, dry_run=self.dry_run)
 
                     logger.info("Closing short position before going long")
-                    self.place_order('buy')
+                    close_result = self.place_order('buy')
+                    if not close_result:
+                        logger.error("Failed to close short position, aborting long entry")
+                        return
 
                 logger.info("Opening long position")
                 result = self.place_order('buy')
@@ -652,7 +655,10 @@ class AdaptiveBot:
                             self.record_exit(current_price, self.entry_volume or self.order_size, dry_run=self.dry_run)
 
                     logger.info("Closing long position before going short")
-                    self.place_order('sell')
+                    close_result = self.place_order('sell')
+                    if not close_result:
+                        logger.error("Failed to close long position, aborting short entry")
+                        return
 
                 logger.info("Opening short position")
                 result = self.place_order('sell')
@@ -719,6 +725,14 @@ class AdaptiveBot:
         """Stop the trading bot."""
         logger.info("Stopping adaptive trading bot...")
         self.running = False
+
+        # Close database connection
+        if self.db:
+            try:
+                self.db.close()
+            except Exception as e:
+                logger.warning(f"Failed to close database: {e}")
+
         logger.info("Bot stopped")
 
 
@@ -734,6 +748,7 @@ def main():
     config = dict(os.environ)
 
     try:
+        validate_config(config)
         bot = AdaptiveBot(api_key, api_secret, config)
         bot.start()
     except ConfigError as e:
