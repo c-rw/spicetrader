@@ -62,6 +62,38 @@
 		</section>
 
 		<section>
+			<h2>Current Prices</h2>
+			{#if data.tables.latest_market_conditions.length === 0}
+				<p>No market data yet — bot is still warming up.</p>
+			{:else}
+				<table>
+					<thead>
+						<tr>
+							<th>Symbol</th>
+							<th>Price</th>
+							<th>Market State</th>
+							<th>Strategy</th>
+							<th>Confidence</th>
+							<th>Updated</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each data.tables.latest_market_conditions as mc}
+							<tr>
+								<td>{mc.symbol}</td>
+								<td>${mc.price != null ? mc.price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 }) : '—'}</td>
+								<td>{mc.state ?? '—'}</td>
+								<td>{mc.active_strategy ?? '—'}</td>
+								<td>{mc.confidence != null ? (mc.confidence * 100).toFixed(0) + '%' : '—'}</td>
+								<td>{mc.timestamp ?? '—'}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			{/if}
+		</section>
+
+		<section>
 			<h2>Open Positions</h2>
 			{#if data.tables.open_positions.length === 0}
 				<p>No open positions.</p>

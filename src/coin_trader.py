@@ -128,7 +128,7 @@ class CoinTrader:
 
         return True
 
-    def analyze_and_update_strategy(self):
+    def analyze_and_update_strategy(self, current_price: Optional[float] = None):
         """Analyze market and update strategy if needed."""
         # Need enough data - check this first, before reanalysis interval
         min_required = self.analyzer.get_required_data_points()
@@ -154,6 +154,26 @@ class CoinTrader:
         self.last_analysis_time = time.time()
 
         logger.info(f"[{self.symbol}] Market: {market_condition.state.value} | Confidence: {market_condition.confidence*100:.0f}%")
+
+        # Record market condition (including current price) to DB for the dashboard
+        if self.db and current_price is not None:
+            try:
+                active_strategy = self._get_strategy_name(self.current_strategy)
+                self.db.record_market_condition(
+                    symbol=self.symbol,
+                    state=market_condition.state.value,
+                    price=current_price,
+                    recommended_strategy=market_condition.get_recommended_strategy(),
+                    active_strategy=active_strategy,
+                    adx=market_condition.adx,
+                    atr=market_condition.atr,
+                    range_percent=market_condition.range_percent,
+                    choppiness=market_condition.choppiness,
+                    slope=market_condition.slope,
+                    confidence=market_condition.confidence,
+                )
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] Failed to record market condition: {e}")
 
         # Get recommended strategy
         recommended_strategy_name = market_condition.get_recommended_strategy()
@@ -288,7 +308,7 @@ class CoinTrader:
         self.update_price_history(close, high, low)
 
         # Analyze and potentially switch strategy
-        self.analyze_and_update_strategy()
+        self.analyze_and_update_strategy(current_price=close)
 
         # If no strategy yet, wait
         if self.current_strategy is None:
