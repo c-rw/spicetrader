@@ -29,13 +29,13 @@ echo "==> Pulling latest changes..."
 git pull
 
 echo "==> Stopping existing containers..."
-docker compose down --remove-orphans
+docker-compose down --remove-orphans
 
 echo "==> Rebuilding all images (no cache)..."
-docker compose build --no-cache
+docker-compose build --no-cache
 
 echo "==> Starting all services..."
-docker compose up -d
+docker-compose up -d
 
 echo ""
 echo "==> Deployment complete."
@@ -43,4 +43,4 @@ echo "    Dashboard UI : http://$(hostname -I | awk '{print $1}'):${UI_PORT:-300
 echo "    API backend  : ${API_HOST:-127.0.0.1}:${API_PORT:-8000} (internal)"
 echo ""
 echo "==> Container status:"
-docker compose ps
+docker-compose ps
