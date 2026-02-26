@@ -1,9 +1,10 @@
 """MACD Strategy for moderate trending markets."""
 import logging
+import time
 from typing import Optional, Dict, Any
 from .base import TradingStrategy
 from ..indicators import calculate_macd
-from ..config_utils import require_bool, require_int
+from ..config_utils import require_bool, require_float, require_int
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,14 @@ class MACDStrategy(TradingStrategy):
         # Histogram confirmation
         self.require_histogram_confirm = require_bool(config, 'MACD_HISTOGRAM_CONFIRM')
 
+        # Profit target checking (matches SMA Crossover behaviour)
+        self.min_profit_target = require_float(config, 'MIN_PROFIT_TARGET')
+        # entry_price is inherited from TradingStrategy base class
+        self.entry_time = None
+
+        # Minimum hold time (seconds) to prevent whipsaws
+        self.min_hold_time = require_int(config, 'MIN_HOLD_TIME')
+
         # Track previous MACD values for crossover detection
         self.prev_macd_line = None
         self.prev_signal_line = None
@@ -45,6 +54,8 @@ class MACDStrategy(TradingStrategy):
         logger.info(f"MACD Strategy initialized:")
         logger.info(f"  Fast: {self.fast_period}, Slow: {self.slow_period}, Signal: {self.signal_period}")
         logger.info(f"  Histogram Confirmation: {self.require_histogram_confirm}")
+        logger.info(f"  Min Profit Target: {self.min_profit_target*100:.2f}%")
+        logger.info(f"  Min Hold Time: {self.min_hold_time}s ({self.min_hold_time/60:.1f} min)")
 
     def get_strategy_name(self) -> str:
         """Return strategy name."""
@@ -61,6 +72,13 @@ class MACDStrategy(TradingStrategy):
             'buy', 'sell', or None
         """
         ohlc = market_data.get('ohlc')
+
+        # --- Stop-loss check (before any indicator computation) ---
+        quick_price = self._peek_price(market_data)
+        if quick_price is not None:
+            stop = self.check_stop_loss(quick_price)
+            if stop:
+                return stop
 
         # Prefer committed OHLC close series for indicator correctness.
         if isinstance(ohlc, dict) and ohlc.get('closes'):
@@ -138,9 +156,44 @@ class MACDStrategy(TradingStrategy):
                         logger.info("  ✓ Histogram negative")
                     signal = 'sell'
 
+        # PROFIT TARGET CHECK before selling
+        if signal == 'sell' and self.entry_price is not None:
+            profit_pct = (current_price - self.entry_price) / self.entry_price
+
+            if profit_pct < self.min_profit_target:
+                logger.debug(f"⚠️ SELL signal ignored - profit too low:")
+                logger.debug(f"  Current profit: {profit_pct*100:.2f}% < Target: {self.min_profit_target*100:.2f}%")
+                logger.debug(f"  Entry: ${self.entry_price:,.2f} → Current: ${current_price:,.2f}")
+                signal = None  # Don't sell yet
+
+        # FEE-AWARE BREAKEVEN CHECK: don't sell below round-trip fee cost
+        if signal == 'sell' and not self.is_above_breakeven(current_price):
+            logger.debug(
+                f"⚠️ SELL signal ignored - below fee-adjusted breakeven "
+                f"(round-trip fee ~{self._roundtrip_fee_pct*100:.2f}%)"
+            )
+            signal = None
+
+        # MINIMUM HOLD TIME CHECK
+        if signal == 'sell' and self.entry_time is not None:
+            hold_time = time.time() - self.entry_time
+            if hold_time < self.min_hold_time:
+                logger.info(f"⚠️ SELL signal ignored - hold time too short:")
+                logger.info(f"  Held for: {hold_time:.0f}s ({hold_time/60:.1f}min) < Min: {self.min_hold_time}s ({self.min_hold_time/60:.1f}min)")
+                signal = None  # Don't sell yet
+
         # Update previous values
         self.prev_macd_line = macd_line
         self.prev_signal_line = signal_line
+
+        # Track entry/exit price and time
+        if signal == 'buy':
+            self.entry_price = current_price
+            self.entry_time = time.time()
+            logger.info(f"📊 Entry tracked: ${self.entry_price:,.2f} at {time.strftime('%H:%M:%S', time.localtime(self.entry_time))}")
+        elif signal == 'sell':
+            self.entry_price = None
+            self.entry_time = None
 
         # Log current trend if no signal
         if signal is None:
@@ -155,23 +208,10 @@ class MACDStrategy(TradingStrategy):
 
         return signal
 
-    def _find_pair_key(self, ticker_data: dict) -> Optional[str]:
-        """Find the actual trading pair key in ticker response."""
-        # Try common variations
-        variations = ['XBTUSD', 'XXBTZUSD', 'BTCUSD', 'ETHUSD', 'XETHZUSD', 'SOLUSD', 'XRPUSD', 'XXRPZUSD']
-
-        for variation in variations:
-            if variation in ticker_data:
-                return variation
-
-        # Return first key if none match
-        if ticker_data:
-            return list(ticker_data.keys())[0]
-
-        return None
-
     def reset(self) -> None:
         """Reset strategy state."""
         super().reset()
         self.prev_macd_line = None
         self.prev_signal_line = None
+        # entry_price is cleared by super().reset()
+        self.entry_time = None

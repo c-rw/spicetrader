@@ -538,9 +538,9 @@ class KrakenClient:
             'volume': str(volume),
         }
 
-        if price:
+        if price is not None:
             data['price'] = str(price)
-        if price2:
+        if price2 is not None:
             data['price2'] = str(price2)
         if leverage:
             data['leverage'] = leverage
@@ -565,6 +565,18 @@ class KrakenClient:
     def cancel_all_orders(self) -> Dict[str, Any]:
         """Cancel all open orders."""
         return self._make_request('CancelAll', private=True)
+
+    def query_trades(self, txid: str) -> Dict[str, Any]:
+        """
+        Query specific trades by trade ID.
+
+        Args:
+            txid: Trade ID(s) (comma-separated)
+
+        Returns:
+            dict: Trade details keyed by trade ID
+        """
+        return self._make_request('QueryTrades', {'txid': txid}, private=True)
 
     def get_order_fee(self, txid: str) -> dict:
         """
@@ -595,10 +607,10 @@ class KrakenClient:
 
             # Sum up fees from all trades
             for trade_id in trades:
-                # Get trade details
-                trade_info = self.get_trades_history(txid=trade_id)
-                if trade_info and 'trades' in trade_info:
-                    for tid, trade in trade_info['trades'].items():
+                # Get trade details via QueryTrades endpoint
+                trade_info = self.query_trades(trade_id)
+                if trade_info:
+                    for tid, trade in trade_info.items():
                         fee = float(trade.get('fee', 0.0))
                         total_fee += fee
 
@@ -643,22 +655,22 @@ class KrakenClient:
         """
         Get actual fee for a trade using ledger lookup.
 
-        This method queries the ledger to find the actual fee charged,
-        waiting briefly for the trade to settle if needed.
+        Attempts a single non-blocking lookup first. If not found and
+        ``max_wait_seconds`` > 0, retries briefly to allow settlement.
 
         Args:
             txid: Transaction ID from order placement
-            max_wait_seconds: Maximum time to wait for trade to appear in ledger
+            max_wait_seconds: Maximum time to wait for trade to appear in ledger.
+                              Set to 0 for a single non-blocking attempt (recommended
+                              to avoid stalling the main trading loop).
 
         Returns:
             float: Actual fee charged, or 0.0 if not found
         """
-        import time
-
         start_time = time.time()
-        wait_interval = 0.5  # Check every 0.5 seconds
+        wait_interval = 1.0  # Check every 1 second (was 0.5 — reduces API calls)
 
-        while (time.time() - start_time) < max_wait_seconds:
+        while True:
             try:
                 # Query recent ledger entries for trades
                 ledger_result = self.query_ledgers(type='trade')
@@ -672,12 +684,16 @@ class KrakenClient:
                             logger.info(f"Found actual fee for {txid}: ${fee:.2f}")
                             return fee
 
-                # If not found, wait and retry
-                time.sleep(wait_interval)
-
             except Exception as e:
                 logger.warning(f"Error querying ledger for {txid}: {e}")
                 break
+
+            # Check if we've exceeded the wait budget
+            elapsed = time.time() - start_time
+            if elapsed >= max_wait_seconds:
+                break
+
+            time.sleep(wait_interval)
 
         logger.warning(f"Could not find actual fee for {txid} after {max_wait_seconds}s")
         return 0.0

@@ -100,7 +100,7 @@ class MeanReversionStrategy(TradingStrategy):
         if min_profit_raw is None:
             min_profit_raw = require_float(config, 'MIN_PROFIT_TARGET')
         self.min_profit_target = float(min_profit_raw)
-        self.entry_price = None  # Track entry price for profit calculation
+        # entry_price is inherited from TradingStrategy base class
 
         logger.info(f"Mean Reversion Strategy initialized for {symbol or 'default'}:")
         logger.info(f"  RSI: {self.rsi_period} period, oversold < {self.rsi_oversold}, overbought > {self.rsi_overbought}")
@@ -184,6 +184,14 @@ class MeanReversionStrategy(TradingStrategy):
             'buy', 'sell', or None
         """
         ohlc = market_data.get('ohlc')
+
+        # --- Stop-loss check (before any indicator computation) ---
+        # Peek at the current price and bail early if stop-loss is hit.
+        quick_price = self._peek_price(market_data)
+        if quick_price is not None:
+            stop = self.check_stop_loss(quick_price)
+            if stop:
+                return stop
 
         # Prefer committed OHLC close series for indicator correctness.
         if isinstance(ohlc, dict) and ohlc.get('closes'):
@@ -301,8 +309,8 @@ class MeanReversionStrategy(TradingStrategy):
         if self.position == 'long' and self.entry_price is not None:
             profit_pct = (current_price - self.entry_price) / self.entry_price
 
-            # Exit if 2%+ profit with basic confirmation
-            if profit_pct >= 0.02:  # 2% profit target
+            # Exit if 2%+ gross profit with basic confirmation, but only if above breakeven after fees
+            if profit_pct >= 0.02 and self.is_above_breakeven(current_price):
                 # Require basic confirmation: neutral/positive RSI and price above middle BB
                 if rsi > 50 and current_price > middle_bb:
                     logger.info(f"🔴 PROFIT TARGET EXIT:")
@@ -355,28 +363,10 @@ class MeanReversionStrategy(TradingStrategy):
 
         return None
 
-    def _find_pair_key(self, ticker_data: dict) -> Optional[str]:
-        """
-        Find the actual trading pair key in ticker response.
-
-        Args:
-            ticker_data: Ticker data dictionary
-
-        Returns:
-            Pair key or None
-        """
-        # Prefer the configured symbol, otherwise use the only returned key.
-        if self.symbol and self.symbol in ticker_data:
-            return self.symbol
-
-        if isinstance(ticker_data, dict) and len(ticker_data) == 1:
-            return next(iter(ticker_data.keys()))
-
-        # Return first key if none match
-        if ticker_data:
-            return next(iter(ticker_data.keys()))
-
-        return None
+    def reset(self) -> None:
+        """Reset strategy state, including entry price tracking."""
+        super().reset()
+        self.entry_price = None
 
     def _update_support_resistance(self, prices: list) -> None:
         """

@@ -2,7 +2,7 @@
 import logging
 from typing import Optional, Dict, Any, List
 from .base import TradingStrategy
-from ..config_utils import require_float, require_int
+from ..config_utils import optional, require_float, require_int
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,10 @@ class GridTradingStrategy(TradingStrategy):
         self.grid_spacing_pct = require_float(config, 'GRID_SPACING_PCT')
         self.grid_center = None  # Will be set based on current price
 
+        # How close price must be to a grid level to trigger (default 0.3%)
+        trigger_raw = optional(config, 'GRID_TRIGGER_PCT')
+        self.grid_trigger_pct = float(trigger_raw) / 100.0 if trigger_raw is not None else 0.003
+
         # Track grid levels and orders
         self.buy_levels = []
         self.sell_levels = []
@@ -49,6 +53,7 @@ class GridTradingStrategy(TradingStrategy):
         logger.info(f"Grid Trading Strategy initialized:")
         logger.info(f"  Grid Size: {self.grid_size} levels")
         logger.info(f"  Spacing: {self.grid_spacing_pct}% per level")
+        logger.info(f"  Trigger Proximity: {self.grid_trigger_pct*100:.1f}%")
 
     def get_strategy_name(self) -> str:
         """Return strategy name."""
@@ -64,17 +69,27 @@ class GridTradingStrategy(TradingStrategy):
         Returns:
             'buy', 'sell', or None
         """
-        # Extract current price from ticker
-        ticker_data = market_data.get('ticker', {})
-        pair_key = self._find_pair_key(ticker_data)
+        # Prefer OHLC close price for consistency with other strategies.
+        ohlc = market_data.get('ohlc')
+        if isinstance(ohlc, dict) and isinstance(ohlc.get('latest'), dict) and 'close' in ohlc['latest']:
+            current_price = float(ohlc['latest']['close'])
+        else:
+            # Fallback: extract current price from ticker
+            ticker_data = market_data.get('ticker', {})
+            pair_key = self._find_pair_key(ticker_data)
 
-        if not pair_key:
-            logger.error("Trading pair not found in ticker data")
-            return None
+            if not pair_key:
+                logger.error("Trading pair not found in ticker data")
+                return None
 
-        # Get current price
-        current_price = float(ticker_data[pair_key]['c'][0])
+            current_price = float(ticker_data[pair_key]['c'][0])
+
         self.add_price(current_price)
+
+        # --- Stop-loss check (before grid logic) ---
+        stop = self.check_stop_loss(current_price)
+        if stop:
+            return stop
 
         # Need some data to establish grid center
         if not self.has_sufficient_data(10):
@@ -113,18 +128,20 @@ class GridTradingStrategy(TradingStrategy):
 
         # BUY SIGNAL: Price near a buy level that hasn't been filled
         if nearest_buy_level and nearest_buy_level not in self.filled_buys:
-            # Check if price is close enough to level (within 0.1%)
-            if abs(current_price - nearest_buy_level) / nearest_buy_level < 0.001:
+            # Check if price is close enough to level
+            if abs(current_price - nearest_buy_level) / nearest_buy_level < self.grid_trigger_pct:
                 logger.info(f"🟢 BUY signal at grid level ${nearest_buy_level:,.2f}")
                 self.filled_buys.add(nearest_buy_level)
+                self.entry_price = current_price
                 return 'buy'
 
         # SELL SIGNAL: Price near a sell level that hasn't been filled
         if nearest_sell_level and nearest_sell_level not in self.filled_sells:
-            # Check if price is close enough to level (within 0.1%)
-            if abs(current_price - nearest_sell_level) / nearest_sell_level < 0.001:
+            # Check if price is close enough to level
+            if abs(current_price - nearest_sell_level) / nearest_sell_level < self.grid_trigger_pct:
                 logger.info(f"🔴 SELL signal at grid level ${nearest_sell_level:,.2f}")
                 self.filled_sells.add(nearest_sell_level)
+                self.entry_price = None
                 return 'sell'
 
         # Show grid status
@@ -149,6 +166,9 @@ class GridTradingStrategy(TradingStrategy):
 
         # Calculate grid levels
         half_grid = self.grid_size // 2
+        if half_grid < 1:
+            logger.warning(f"Grid size {self.grid_size} too small for grid levels, using minimum of 2 levels")
+            half_grid = 1
 
         # Buy levels (below center)
         for i in range(1, half_grid + 1):
@@ -190,21 +210,6 @@ class GridTradingStrategy(TradingStrategy):
             # Find lowest level above price
             candidates = [l for l in levels if l > price]
             return min(candidates) if candidates else None
-
-    def _find_pair_key(self, ticker_data: dict) -> Optional[str]:
-        """Find the actual trading pair key in ticker response."""
-        # Try common variations
-        variations = ['XBTUSD', 'XXBTZUSD', 'BTCUSD', 'ETHUSD', 'XETHZUSD', 'SOLUSD', 'XRPUSD', 'XXRPZUSD']
-
-        for variation in variations:
-            if variation in ticker_data:
-                return variation
-
-        # Return first key if none match
-        if ticker_data:
-            return list(ticker_data.keys())[0]
-
-        return None
 
     def reset(self) -> None:
         """Reset strategy state."""

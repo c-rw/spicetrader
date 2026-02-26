@@ -43,7 +43,7 @@ class SMACrossoverStrategy(TradingStrategy):
 
         # Profit target checking
         self.min_profit_target = require_float(config, 'MIN_PROFIT_TARGET')
-        self.entry_price = None
+        # entry_price is inherited from TradingStrategy base class
         self.entry_time = None
 
         # Minimum hold time (seconds) to prevent whipsaws
@@ -73,6 +73,14 @@ class SMACrossoverStrategy(TradingStrategy):
             'buy', 'sell', or None
         """
         ohlc = market_data.get('ohlc')
+
+        # --- Stop-loss check (before any indicator computation) ---
+        quick_price = self._peek_price(market_data)
+        if quick_price is not None:
+            stop = self.check_stop_loss(quick_price)
+            if stop:
+                self.entry_time = None
+                return stop
 
         # Prefer committed OHLC close series for indicator correctness.
         if isinstance(ohlc, dict) and ohlc.get('closes'):
@@ -162,6 +170,14 @@ class SMACrossoverStrategy(TradingStrategy):
                     else:
                         logger.info(f"✅ Profit target met: {profit_pct*100:.2f}% >= {self.min_profit_target*100:.2f}%")
 
+                # FEE-AWARE BREAKEVEN CHECK: don't sell below round-trip fee cost
+                if signal == 'sell' and not self.is_above_breakeven(current_price):
+                    logger.debug(
+                        f"⚠️ SELL signal ignored - below fee-adjusted breakeven "
+                        f"(round-trip fee ~{self._roundtrip_fee_pct*100:.2f}%)"
+                    )
+                    signal = None
+
                 # MINIMUM HOLD TIME CHECK
                 if signal == 'sell' and self.entry_time is not None:
                     hold_time = time.time() - self.entry_time
@@ -197,33 +213,10 @@ class SMACrossoverStrategy(TradingStrategy):
 
         return signal
 
-    def _find_pair_key(self, ticker_data: dict) -> Optional[str]:
-        """
-        Find the actual trading pair key in ticker response.
-
-        Args:
-            ticker_data: Ticker data dictionary
-
-        Returns:
-            Pair key or None
-        """
-        # Common pair variations
-        variations = ['XBTUSD', 'XXBTZUSD', 'BTCUSD', 'ETHUSD', 'XETHZUSD', 'SOLUSD', 'XRPUSD', 'XXRPZUSD']
-
-        for variation in variations:
-            if variation in ticker_data:
-                return variation
-
-        # Return first key if none match
-        if ticker_data:
-            return list(ticker_data.keys())[0]
-
-        return None
-
     def reset(self) -> None:
         """Reset strategy state."""
         super().reset()
         self.prev_fast_sma = None
         self.prev_slow_sma = None
-        self.entry_price = None
+        # entry_price is cleared by super().reset()
         self.entry_time = None

@@ -50,7 +50,7 @@ class MarketAnalyzer:
         self.range_period = require_int(self.config, 'RANGE_PERIOD')
 
         # Caching for analysis results (per-symbol)
-        self._analysis_cache: Dict[str, Tuple[MarketCondition, float]] = {}  # symbol -> (condition, timestamp)
+        self._analysis_cache: Dict[str, Tuple[MarketCondition, float, Optional[float]]] = {}  # symbol -> (condition, timestamp, last_price)
         self.cache_ttl = require_int(self.config, 'ANALYSIS_CACHE_TTL')
 
         logger.info("MarketAnalyzer initialized with thresholds:")
@@ -68,16 +68,24 @@ class MarketAnalyzer:
         """
         return max(self.adx_period * 2, self.range_period)
 
-    def _get_cache_key(self, prices: List[float]) -> str:
-        """Get cache key from most recent price."""
-        return f"price_{prices[-1] if prices else 0}" if prices else "empty"
+    def _is_cache_valid(self, symbol: Optional[str] = None, prices: Optional[List[float]] = None) -> bool:
+        """Check if cache entry exists and is still valid.
 
-    def _is_cache_valid(self, symbol: Optional[str] = None) -> bool:
-        """Check if cache entry exists and is still valid."""
+        The cache is keyed on (symbol, timestamp) and also checks that the
+        latest price hasn't changed — this detects new candle arrivals even
+        within the TTL window.
+        """
         if not symbol or symbol not in self._analysis_cache:
             return False
-        condition, timestamp = self._analysis_cache[symbol]
-        return time.time() - timestamp < self.cache_ttl
+        condition, timestamp, cached_price_tail = self._analysis_cache[symbol]
+        if time.time() - timestamp >= self.cache_ttl:
+            return False
+        # Invalidate if the latest price changed (new candle arrived).
+        if prices and len(prices) > 0:
+            current_tail = prices[-1]
+            if cached_price_tail is not None and current_tail != cached_price_tail:
+                return False
+        return True
 
     def analyze(
         self,
@@ -99,8 +107,8 @@ class MarketAnalyzer:
             MarketCondition object describing current market state
         """
         # Check cache first if symbol provided
-        if symbol and self._is_cache_valid(symbol):
-            condition, _ = self._analysis_cache[symbol]
+        if symbol and self._is_cache_valid(symbol, prices):
+            condition, _, _ = self._analysis_cache[symbol]
             logger.debug(f"[{symbol}] Using cached market condition (TTL: {self.cache_ttl}s)")
             return condition
 
@@ -146,7 +154,8 @@ class MarketAnalyzer:
 
         # Cache result if symbol provided
         if symbol:
-            self._analysis_cache[symbol] = (condition, time.time())
+            price_tail = prices[-1] if prices else None
+            self._analysis_cache[symbol] = (condition, time.time(), price_tail)
 
         return condition
 
@@ -256,12 +265,3 @@ class MarketAnalyzer:
         }
 
         return descriptions.get(state, "Unknown market condition")
-
-    def get_required_data_points(self) -> int:
-        """
-        Get minimum number of data points required for analysis.
-
-        Returns:
-            Minimum data points needed
-        """
-        return max(self.adx_period * 2, self.range_period)

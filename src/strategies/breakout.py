@@ -1,5 +1,6 @@
 """Breakout Strategy for volatile markets."""
 import logging
+from collections import deque
 from typing import Optional, Dict, Any
 from .base import TradingStrategy
 from ..indicators import (
@@ -52,18 +53,22 @@ class BreakoutStrategy(TradingStrategy):
         self.breakout_confirmed = False
         self.breakout_type = None  # 'bullish' or 'bearish'
 
-        # Volume history
-        self.volume_history = []
+        # Volume history (bounded to prevent unbounded growth)
+        self.volume_history = deque(maxlen=500)
 
         # Fibonacci analysis settings (for profit targets)
         self.use_fibonacci = require_bool(config, 'USE_FIBONACCI')
         self.fib_lookback_period = require_int(config, 'FIB_LOOKBACK_PERIOD')
+
+        # Profit target checking (prevents selling at a loss on noise)
+        self.min_profit_target = require_float(config, 'MIN_PROFIT_TARGET')
 
         logger.info(f"Breakout Strategy initialized:")
         logger.info(f"  ATR Period: {self.atr_period}, Multiplier: {self.atr_multiplier}x")
         logger.info(f"  Volume Threshold: {self.volume_threshold}x average")
         logger.info(f"  Lookback: {self.lookback_period} periods")
         logger.info(f"  Require Retest: {self.require_retest}")
+        logger.info(f"  Min Profit Target: {self.min_profit_target*100:.2f}%")
         logger.info(f"  Fibonacci: {'Enabled' if self.use_fibonacci else 'Disabled'} (lookback: {self.fib_lookback_period})")
 
     def get_strategy_name(self) -> str:
@@ -81,6 +86,14 @@ class BreakoutStrategy(TradingStrategy):
             'buy', 'sell', or None
         """
         ohlc = market_data.get('ohlc')
+
+        # --- Stop-loss check (before any indicator computation) ---
+        quick_price = self._peek_price(market_data)
+        if quick_price is not None:
+            stop = self.check_stop_loss(quick_price)
+            if stop:
+                self.breakout_confirmed = False
+                return stop
 
         # Prefer committed OHLC candles for correctness (high/low/volume per candle).
         if isinstance(ohlc, dict) and ohlc.get('closes') and ohlc.get('highs') and ohlc.get('lows'):
@@ -178,20 +191,38 @@ class BreakoutStrategy(TradingStrategy):
         # Detect breakout conditions
 
         def atr_is_high(lookback: int = 20) -> bool:
-            # Compare current ATR to average ATR over recent windows.
-            if len(prices) < self.atr_period + 2:
+            """Compare current ATR to average ATR over recent windows.
+
+            Uses a single-pass rolling True Range sum instead of calling
+            calculate_atr for every window, reducing O(lookback * period)
+            to O(lookback + period).
+            """
+            min_len = self.atr_period + lookback + 1
+            if len(prices) < self.atr_period + 2 or len(prices) < min_len:
                 return False
-            start = max(self.atr_period + 1, len(prices) - (lookback + self.atr_period))
-            atr_vals = []
-            for end in range(start, len(prices) + 1):
-                window_highs = highs[max(0, end - (self.atr_period + 1)):end]
-                window_lows = lows[max(0, end - (self.atr_period + 1)):end]
-                window_closes = prices[max(0, end - (self.atr_period + 1)):end]
-                v = calculate_atr(window_highs, window_lows, window_closes, self.atr_period)
-                if v is not None:
-                    atr_vals.append(v)
+
+            # Pre-compute TR series once for the range we need.
+            start_idx = max(1, len(prices) - (lookback + self.atr_period))
+            tr_series = []
+            for i in range(start_idx, len(prices)):
+                high_low = highs[i] - lows[i]
+                high_close = abs(highs[i] - prices[i - 1])
+                low_close = abs(lows[i] - prices[i - 1])
+                tr_series.append(max(high_low, high_close, low_close))
+
+            if len(tr_series) < self.atr_period:
+                return False
+
+            # Build ATR values using a rolling sum.
+            rolling_tr = sum(tr_series[:self.atr_period])
+            atr_vals = [rolling_tr / self.atr_period]
+            for i in range(self.atr_period, len(tr_series)):
+                rolling_tr += tr_series[i] - tr_series[i - self.atr_period]
+                atr_vals.append(rolling_tr / self.atr_period)
+
             if len(atr_vals) < 3:
                 return False
+
             avg_atr = sum(atr_vals[:-1]) / max(1, (len(atr_vals) - 1))
             return avg_atr > 0 and atr >= avg_atr
 
@@ -214,6 +245,7 @@ class BreakoutStrategy(TradingStrategy):
                     logger.info(f"     Target 3: ${fib_extensions['261.8%']:,.0f} (261.8%)")
 
                 if not self.require_retest or self.breakout_confirmed:
+                    self.entry_price = current_price
                     return 'buy'
                 else:
                     self.breakout_confirmed = True
@@ -226,6 +258,25 @@ class BreakoutStrategy(TradingStrategy):
             atr_high = atr_is_high()
 
             if volume_surge and atr_high:
+                # PROFIT TARGET CHECK: Don't sell at a loss unless stop-loss handles it
+                if self.entry_price is not None and self.position == 'long':
+                    profit_pct = (current_price - self.entry_price) / self.entry_price
+                    if profit_pct < self.min_profit_target:
+                        logger.debug(
+                            f"⚠️ Bearish breakout SELL gated - profit too low: "
+                            f"{profit_pct*100:.2f}% < {self.min_profit_target*100:.2f}%"
+                        )
+                        # Let stop-loss handle deep losses; skip small-loss sells
+                        return None
+
+                # FEE-AWARE BREAKEVEN CHECK: don't sell below round-trip fee cost
+                if not self.is_above_breakeven(current_price):
+                    logger.debug(
+                        f"⚠️ Bearish breakout SELL gated - below fee-adjusted breakeven "
+                        f"(round-trip fee ~{self._roundtrip_fee_pct*100:.2f}%)"
+                    )
+                    return None
+
                 logger.info(f"🔻 BEARISH BREAKOUT DETECTED!")
                 logger.info(f"  ✓ Price broke support ${self.last_support:,.2f}")
                 logger.info(f"  ✓ Volume surge confirmed ({self.volume_threshold}x)")
@@ -236,6 +287,7 @@ class BreakoutStrategy(TradingStrategy):
                     logger.info(f"  ⚠️  Consider exiting positions or setting stop losses")
 
                 if not self.require_retest or self.breakout_confirmed:
+                    self.entry_price = None
                     return 'sell'
                 else:
                     self.breakout_confirmed = True
@@ -250,6 +302,7 @@ class BreakoutStrategy(TradingStrategy):
                 if abs(current_price - self.last_resistance) / self.last_resistance < 0.02:
                     logger.info("✓ Retest confirmed! Price holding above old resistance")
                     self.breakout_confirmed = False
+                    self.entry_price = current_price
                     return 'buy'
 
             elif self.breakout_type == 'bearish' and self.last_support:
@@ -257,30 +310,16 @@ class BreakoutStrategy(TradingStrategy):
                 if abs(current_price - self.last_support) / self.last_support < 0.02:
                     logger.info("✓ Retest confirmed! Price holding below old support")
                     self.breakout_confirmed = False
+                    self.entry_price = None
                     return 'sell'
 
         # No breakout signal
         status = "Within range"
-        if self.last_support and self.last_resistance:
+        if self.last_support and self.last_resistance and self.last_resistance != self.last_support:
             range_position = (current_price - self.last_support) / (self.last_resistance - self.last_support) * 100
             status = f"In range ({range_position:.0f}% from support to resistance)"
 
         logger.info(f"Status: {status} | Position: {self.position or 'None'}")
-        return None
-
-    def _find_pair_key(self, ticker_data: dict) -> Optional[str]:
-        """Find the actual trading pair key in ticker response."""
-        # Try common variations
-        variations = ['XBTUSD', 'XXBTZUSD', 'BTCUSD', 'ETHUSD', 'XETHZUSD', 'SOLUSD', 'XRPUSD', 'XXRPZUSD']
-
-        for variation in variations:
-            if variation in ticker_data:
-                return variation
-
-        # Return first key if none match
-        if ticker_data:
-            return list(ticker_data.keys())[0]
-
         return None
 
     def reset(self) -> None:

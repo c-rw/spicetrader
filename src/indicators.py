@@ -5,7 +5,11 @@ import statistics
 
 def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
     """
-    Calculate Relative Strength Index (RSI).
+    Calculate Relative Strength Index (RSI) using Wilder's smoothing.
+
+    Uses the standard Wilder's smoothed moving average (SMMA) method:
+    - Seed avg_gain/avg_loss with a simple average over the first `period` changes
+    - Smooth subsequent values: avg = (prev_avg * (period-1) + current) / period
 
     Args:
         prices: List of prices (most recent last)
@@ -17,16 +21,20 @@ def calculate_rsi(prices: List[float], period: int = 14) -> Optional[float]:
     if len(prices) < period + 1:
         return None
 
-    # Calculate price changes
-    changes = [prices[i] - prices[i - 1] for i in range(-period, 0)]
+    # Calculate all price changes
+    changes = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
 
-    # Separate gains and losses
-    gains = [change if change > 0 else 0 for change in changes]
-    losses = [-change if change < 0 else 0 for change in changes]
+    # Seed with simple average over first `period` changes
+    gains_seed = [max(c, 0) for c in changes[:period]]
+    losses_seed = [max(-c, 0) for c in changes[:period]]
 
-    # Calculate average gain and loss
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
+    avg_gain = sum(gains_seed) / period
+    avg_loss = sum(losses_seed) / period
+
+    # Apply Wilder's smoothing for the remaining changes
+    for c in changes[period:]:
+        avg_gain = (avg_gain * (period - 1) + max(c, 0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-c, 0)) / period
 
     # Avoid division by zero
     if avg_loss == 0:
@@ -174,7 +182,7 @@ def _cluster_levels(levels: List[float], threshold: float) -> List[float]:
     for level in levels[1:]:
         # Check if within threshold of current cluster average
         cluster_avg = sum(current_cluster) / len(current_cluster)
-        if abs(level - cluster_avg) / cluster_avg <= threshold:
+        if cluster_avg > 0 and abs(level - cluster_avg) / cluster_avg <= threshold:
             current_cluster.append(level)
         else:
             # Save current cluster and start new one
@@ -229,6 +237,9 @@ def calculate_adx(
     - ADX 20-25: Moderate trend
     - ADX < 20: Weak trend or ranging market
 
+    Uses O(n) computation by pre-computing the True Range series once and
+    using rolling sums instead of calling calculate_atr in a loop.
+
     Args:
         highs: List of high prices
         lows: List of low prices
@@ -238,14 +249,21 @@ def calculate_adx(
     Returns:
         ADX value (0-100) or None if insufficient data
     """
-    if len(highs) < period * 2 or len(lows) < period * 2 or len(closes) < period * 2:
+    n = len(highs)
+    if n < period * 2 or len(lows) < period * 2 or len(closes) < period * 2:
         return None
 
-    # Calculate +DM and -DM
+    # Pre-compute True Range and Directional Movement series in a single pass.
+    tr_series = []
     plus_dm = []
     minus_dm = []
 
-    for i in range(1, len(highs)):
+    for i in range(1, n):
+        high_low = highs[i] - lows[i]
+        high_close = abs(highs[i] - closes[i - 1])
+        low_close = abs(lows[i] - closes[i - 1])
+        tr_series.append(max(high_low, high_close, low_close))
+
         high_diff = highs[i] - highs[i - 1]
         low_diff = lows[i - 1] - lows[i]
 
@@ -259,26 +277,30 @@ def calculate_adx(
         else:
             minus_dm.append(0)
 
-    # Calculate ATR for normalization
-    atr_values = []
-    for i in range(period, len(closes)):
-        atr = calculate_atr(highs[i-period:i+1], lows[i-period:i+1], closes[i-period:i+1], period)
-        if atr:
-            atr_values.append(atr)
-
-    if not atr_values:
+    # Build ATR values using a rolling sum over the TR series (O(n), not O(n*period)).
+    if len(tr_series) < period:
         return None
+
+    atr_values = []
+    rolling_tr = sum(tr_series[:period])
+    atr_values.append(rolling_tr / period)
+    for i in range(period, len(tr_series)):
+        rolling_tr += tr_series[i] - tr_series[i - period]
+        atr_values.append(rolling_tr / period)
 
     # Calculate smoothed +DI and -DI
     plus_di_values = []
     minus_di_values = []
 
     for i in range(period - 1, len(plus_dm)):
-        smoothed_plus_dm = sum(plus_dm[i-period+1:i+1]) / period
-        smoothed_minus_dm = sum(minus_dm[i-period+1:i+1]) / period
+        smoothed_plus_dm = sum(plus_dm[i - period + 1 : i + 1]) / period
+        smoothed_minus_dm = sum(minus_dm[i - period + 1 : i + 1]) / period
 
-        if i - period + 1 < len(atr_values):
-            atr_val = atr_values[min(i - period + 1, len(atr_values) - 1)]
+        # atr_values[j] corresponds to tr_series[j : j+period], which aligns
+        # with index i when j = i - period + 1.
+        atr_idx = i - period + 1
+        if atr_idx < len(atr_values):
+            atr_val = atr_values[min(atr_idx, len(atr_values) - 1)]
             if atr_val > 0:
                 plus_di = (smoothed_plus_dm / atr_val) * 100
                 minus_di = (smoothed_minus_dm / atr_val) * 100
@@ -437,6 +459,8 @@ def calculate_macd(
     MACD is a trend-following momentum indicator that shows the relationship
     between two moving averages of prices.
 
+    Uses O(n) incremental EMA computation instead of recalculating from scratch.
+
     Args:
         prices: List of prices
         fast_period: Fast EMA period (default 12)
@@ -449,34 +473,39 @@ def calculate_macd(
     if len(prices) < slow_period + signal_period:
         return None
 
-    # Calculate fast and slow EMAs
-    fast_ema = calculate_ema(prices, fast_period)
-    slow_ema = calculate_ema(prices, slow_period)
+    # Build full EMA series incrementally for both fast and slow
+    fast_mult = 2 / (fast_period + 1)
+    slow_mult = 2 / (slow_period + 1)
 
-    if fast_ema is None or slow_ema is None:
-        return None
+    # Seed fast EMA with SMA of first fast_period prices
+    fast_ema = sum(prices[:fast_period]) / fast_period
+    # Seed slow EMA with SMA of first slow_period prices
+    slow_ema = sum(prices[:slow_period]) / slow_period
 
-    # MACD line = Fast EMA - Slow EMA
-    macd_line = fast_ema - slow_ema
+    # Advance fast EMA up to slow_period (so both are aligned)
+    for price in prices[fast_period:slow_period]:
+        fast_ema = (price - fast_ema) * fast_mult + fast_ema
 
-    # Calculate signal line (EMA of MACD line)
-    # We need to calculate MACD for all periods to get signal line
-    macd_values = []
-    for i in range(slow_period, len(prices) + 1):
-        f_ema = calculate_ema(prices[:i], fast_period)
-        s_ema = calculate_ema(prices[:i], slow_period)
-        if f_ema and s_ema:
-            macd_values.append(f_ema - s_ema)
+    # Now compute MACD values from slow_period onward
+    macd_values = [fast_ema - slow_ema]
+
+    for price in prices[slow_period:]:
+        fast_ema = (price - fast_ema) * fast_mult + fast_ema
+        slow_ema = (price - slow_ema) * slow_mult + slow_ema
+        macd_values.append(fast_ema - slow_ema)
 
     if len(macd_values) < signal_period:
         return None
 
-    signal_line = calculate_ema(macd_values, signal_period)
+    # Calculate signal line as EMA of MACD values
+    signal_mult = 2 / (signal_period + 1)
+    signal_ema = sum(macd_values[:signal_period]) / signal_period
 
-    if signal_line is None:
-        return None
+    for mv in macd_values[signal_period:]:
+        signal_ema = (mv - signal_ema) * signal_mult + signal_ema
 
-    # Histogram = MACD line - Signal line
+    macd_line = macd_values[-1]
+    signal_line = signal_ema
     histogram = macd_line - signal_line
 
     return (macd_line, signal_line, histogram)

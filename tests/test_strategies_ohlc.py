@@ -33,6 +33,7 @@ def _make_ohlc(closes: List[float]) -> Dict[str, object]:
 
 def test_sma_crossover_uses_ohlc_and_emits_buy_on_bullish_cross():
     config = {
+        'HISTORY_SIZE': 500,
         'FAST_SMA_PERIOD': 3,
         'SLOW_SMA_PERIOD': 5,
         'ENABLE_TREND_FILTER': 'false',
@@ -50,10 +51,13 @@ def test_sma_crossover_uses_ohlc_and_emits_buy_on_bullish_cross():
 
 def test_macd_uses_ohlc_and_emits_buy_on_bullish_cross():
     config = {
+        'HISTORY_SIZE': 500,
         'MACD_FAST': 3,
         'MACD_SLOW': 6,
         'MACD_SIGNAL': 3,
         'MACD_HISTOGRAM_CONFIRM': 'false',
+        'MIN_PROFIT_TARGET': 0.0,
+        'MIN_HOLD_TIME': 0,
     }
     strat = MACDStrategy(config)
 
@@ -82,6 +86,7 @@ def test_macd_uses_ohlc_and_emits_buy_on_bullish_cross():
 
 def test_mean_reversion_uses_ohlc_and_emits_buy_near_support():
     config = {
+        'HISTORY_SIZE': 500,
         'RSI_PERIOD': 5,
         'RSI_OVERSOLD': 80,
         'RSI_OVERBOUGHT': 90,
@@ -89,6 +94,8 @@ def test_mean_reversion_uses_ohlc_and_emits_buy_near_support():
         'BB_STD_DEV': 0.5,
         'AUTO_DETECT_LEVELS': 'false',
         'USE_FIBONACCI': 'false',
+        'FIB_LOOKBACK_PERIOD': 50,
+        'FIB_TOLERANCE': 1.0,
         'SUPPORT_LEVEL': 85,
         'RESISTANCE_LEVEL': 110,
         'SUPPORT_ZONE': 5,

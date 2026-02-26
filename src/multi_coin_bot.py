@@ -11,7 +11,7 @@ from .coin_trader import CoinTrader
 from .database import TradingDatabase
 from .market_data import OHLCCache
 from .position_sizing import equal_split_quote_allocation
-from .config_utils import ConfigError, require, require_bool, require_float, require_int
+from .config_utils import ConfigError, require, require_bool, require_float, require_int, validate_config
 
 # Configure logging
 import pathlib
@@ -101,6 +101,10 @@ class MultiCoinBot:
         self.total_exposure = 0.0
         self.last_balance_log = time.time()
 
+        # Cache for Kraken AssetPairs altname → internal-key mapping.
+        # Populated once on first batch call and reused thereafter (pair names are static).
+        self._altname_cache: Optional[Dict[str, str]] = None
+
         print("\n" + "=" * 80)
         print("MULTI-COIN ADAPTIVE TRADING BOT")
         print("=" * 80)
@@ -123,21 +127,38 @@ class MultiCoinBot:
             return False
 
     def update_account_balance(self) -> bool:
-        """Update account balance."""
+        """Update account balance and recalculate total exposure."""
         try:
             trade_balance = self.client.get_trade_balance()
             self.account_balance = float(trade_balance.get('eb', 0))
 
+            # Recalculate total exposure from open DB positions.
+            self._recalculate_exposure()
+
             # Log balance only every 60 seconds to reduce verbosity
             current_time = time.time()
             if current_time - self.last_balance_log >= 60:
-                logger.info(f"Account Balance: ${self.account_balance:,.2f}")
+                logger.info(f"Account Balance: ${self.account_balance:,.2f} | Exposure: {self.total_exposure:.1f}%")
                 self.last_balance_log = current_time
 
             return True
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
             return False
+
+    def _recalculate_exposure(self) -> None:
+        """Recalculate total_exposure from open DB positions."""
+        if not self.db or self.account_balance <= 0:
+            return
+        total_value = 0.0
+        for symbol in self.trading_pairs:
+            try:
+                pos = self.db.get_open_position(symbol)
+                if pos:
+                    total_value += float(pos['entry_price']) * float(pos['entry_volume'])
+            except Exception:
+                pass
+        self.total_exposure = (total_value / self.account_balance) * 100
 
     def get_market_data(self, symbol: str) -> Optional[dict]:
         """Get market data for a symbol."""
@@ -168,17 +189,23 @@ class MultiCoinBot:
 
             # Resolve Kraken's internal pair keys (e.g., XDGUSD, XXBTZUSD) via AssetPairs altname.
             # This keeps batch mode working for symbols beyond the hard-coded variations.
-            altname_to_key: Dict[str, str] = {}
-            try:
-                asset_pairs = self.client.get_tradable_pairs(pair_string)
-                if isinstance(asset_pairs, dict):
-                    for k, info in asset_pairs.items():
-                        if isinstance(info, dict):
-                            alt = info.get('altname')
-                            if isinstance(alt, str) and alt:
-                                altname_to_key[alt] = k
-            except Exception as e:
-                logger.debug(f"AssetPairs lookup failed (batch): {e}")
+            # The mapping is cached on the instance because pair names are static.
+            if self._altname_cache is None:
+                altname_to_key: Dict[str, str] = {}
+                try:
+                    asset_pairs = self.client.get_tradable_pairs(pair_string)
+                    if isinstance(asset_pairs, dict):
+                        for k, info in asset_pairs.items():
+                            if isinstance(info, dict):
+                                alt = info.get('altname')
+                                if isinstance(alt, str) and alt:
+                                    altname_to_key[alt] = k
+                    self._altname_cache = altname_to_key
+                except Exception as e:
+                    logger.debug(f"AssetPairs lookup failed (batch): {e}")
+                    altname_to_key = {}
+            else:
+                altname_to_key = self._altname_cache
 
             # Debug: log what Kraken returned
             logger.debug(f"Kraken batch response keys: {list(ticker_data.keys())}")
@@ -375,8 +402,8 @@ class MultiCoinBot:
                     logger.info(f"[{symbol}] Signal already acted upon, skipping")
                     continue
 
-                # Get current price
-                market_data = self.get_market_data(symbol)
+                # Reuse batch data instead of making another API call.
+                market_data = all_market_data.get(symbol)
                 if not market_data:
                     continue
 
@@ -447,29 +474,38 @@ class MultiCoinBot:
                             logger.warning(f"[{symbol}] MACD gating check failed, proceeding: {e}")
 
                     # Place order
-                    success, txid = self.place_order(symbol, signal, position_size, current_price)
+                    # For sells, use the stored entry volume from the open position,
+                    # not a freshly calculated size (which depends on current balance).
+                    order_size = position_size
+                    if signal == 'sell' and open_position:
+                        stored_volume = float(open_position.get('entry_volume', 0))
+                        if stored_volume > 0:
+                            order_size = stored_volume
+                            logger.info(f"[{symbol}] Using stored entry volume for exit: {order_size:.6f}")
+
+                    success, txid = self.place_order(symbol, signal, order_size, current_price)
 
                     if success and trader.current_strategy:
                         # Get actual fee from Kraken if not in dry run
                         actual_fee = 0.0
                         if not self.dry_run and txid:
                             logger.info(f"[{symbol}] Fetching actual fee for txid: {txid}")
-                            actual_fee = self.client.get_trade_actual_fee(txid, max_wait_seconds=10)
+                            actual_fee = self.client.get_trade_actual_fee(txid, max_wait_seconds=2)
                             if actual_fee > 0:
                                 logger.info(f"[{symbol}] Actual fee retrieved: ${actual_fee:.2f}")
 
                         # Record entry/exit for fee + DB tracking.
                         if signal == 'buy':
-                            trader.record_entry(current_price, position_size, fee=actual_fee, dry_run=self.dry_run)
+                            trader.record_entry(current_price, order_size, fee=actual_fee, dry_run=self.dry_run)
                             trader.current_strategy.update_position('long')
                         else:  # sell
-                            trader.record_exit(current_price, position_size, fee=actual_fee, dry_run=self.dry_run)
+                            trader.record_exit(current_price, order_size, fee=actual_fee, dry_run=self.dry_run)
                             trader.current_strategy.update_position(None)
 
                         trader.current_strategy.update_signal(signal)
                         trader.total_trades += 1
 
-                        logger.info(f"[{symbol}] ✅ {signal.upper()} executed: {position_size:.6f} @ ${current_price:,.2f}")
+                        logger.info(f"[{symbol}] ✅ {signal.upper()} executed: {order_size:.6f} @ ${current_price:,.2f}")
 
         # Display summary
         self._display_summary()
@@ -560,6 +596,13 @@ class MultiCoinBot:
         logger.info("=" * 80)
         self._display_summary()
 
+        # Close database connection
+        if self.db:
+            try:
+                self.db.close()
+            except Exception as e:
+                logger.warning(f"Failed to close database: {e}")
+
         logger.info("Bot stopped")
 
 
@@ -571,11 +614,11 @@ def main():
     api_secret = _require_env('KRAKEN_API_SECRET')
 
     # Env-pass-through config: everything comes from environment.
-    # Missing required keys will fail fast via config_utils.require_* when accessed.
     _require_env('TRADING_PAIRS')
     config = dict(os.environ)
 
     try:
+        validate_config(config)
         bot = MultiCoinBot(api_key, api_secret, config)
         bot.start()
     except ConfigError as e:
